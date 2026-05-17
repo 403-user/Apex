@@ -1,0 +1,19 @@
+[package]
+name = "apex-renderer"
+version = "0.1.0"
+edition = "2021"
+description = "GPU-accelerated terminal renderer using wgpu/WebGPU"
+
+[dependencies]
+wgpu = "22"
+wgpu-core = "22"
+winit = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+anyhow = "1"
+pollster = "0.4"
+libc = "0.2"
+ab_glyph = "0.2"
+vte-core = { path = "../vte-core" }
+apex-pty = { path = "../apex-pty" }
+tokio = { version = "1", features = ["full"] }

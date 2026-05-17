@@ -1,0 +1,11 @@
+apex-terminal (0.1.0) kali-dev; urgency=medium
+
+  * Initial release for Kali Linux
+  * GPU-accelerated terminal renderer (wgpu/WebGPU)
+  * Native terminal multiplexer (client-server architecture)
+  * AI middleware with MCP protocol + local LLM inference
+  * C2 framework connectors: Sliver, Havoc, Mythic, Empire
+  * Shell stabilization engine derived from pwncat
+  * Lua-based configuration engine with Starship prompt integration
+
+ -- Apex Terminal Team <dev@apex-terminal.io>  Sat, 16 May 2026 00:00:00 +0000

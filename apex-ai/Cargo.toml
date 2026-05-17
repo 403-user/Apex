@@ -1,0 +1,17 @@
+[package]
+name = "apex-ai"
+version = "0.1.0"
+edition = "2021"
+description = "AI middleware layer with MCP protocol and local LLM inference"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+log = "0.4"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+futures-util = "0.3"

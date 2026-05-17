@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 120" width="400" height="120">
+  <defs>
+    <linearGradient id="raGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4A9EFF"/>
+      <stop offset="100%" style="stop-color:#00FFAA"/>
+    </linearGradient>
+    <linearGradient id="oneGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#FF6B9D"/>
+      <stop offset="100%" style="stop-color:#4A9EFF"/>
+    </linearGradient>
+    <linearGradient id="accentLine" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#00FFAA"/>
+      <stop offset="50%" style="stop-color:#4A9EFF"/>
+      <stop offset="100%" style="stop-color:#FF6B9D"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background bar -->
+  <rect x="0" y="40" width="400" height="40" rx="4" fill="#1a1a2e" opacity="0.6"/>
+
+  <!-- Accent line -->
+  <rect x="0" y="80" width="400" height="2" fill="url(#accentLine)" opacity="0.8"/>
+
+  <!-- "Ra" - Left side with gradient -->
+  <text x="80" y="72" font-family="'JetBrains Mono', 'Fira Code', monospace" font-size="52" font-weight="700" fill="url(#raGrad)" text-anchor="middle" letter-spacing="4">Ra</text>
+
+  <!-- "One" - Right side with gradient -->
+  <text x="280" y="72" font-family="'JetBrains Mono', 'Fira Code', monospace" font-size="52" font-weight="700" fill="url(#oneGrad)" text-anchor="middle" letter-spacing="4">One</text>
+
+  <!-- Small subtitle -->
+  <text x="200" y="98" font-family="'JetBrains Mono', monospace" font-size="10" fill="#888" text-anchor="middle" letter-spacing="8" opacity="0.7">APEX TERMINAL</text>
+</svg>

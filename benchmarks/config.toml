@@ -1,0 +1,47 @@
+# Apex Terminal vtebench Benchmark Configuration
+# Usage: vtebench --config benchmarks/config.toml
+#
+# vtebench: https://github.com/apex-terminal/vtebench
+
+[display]
+title = "Apex Terminal Performance Benchmarks"
+output_format = "markdown"
+output_file = "benchmarks/results.md"
+
+[terminal]
+command = "apex"
+args = []
+env = { TERM = "xterm-256color", APEX_LOG = "error" }
+
+[benchmarks]
+# Scroll performance - measures throughput of rapid output
+scroll_speed = { name = "Scroll Speed", command = "yes", duration = 30, lines = 10000 }
+
+# Interactive latency - measures echo latency at various output sizes
+interactive_latency_small = { name = "Latency (small)", command = "bash -c 'for i in {1..100}; do echo \"Line $i\"; done'", duration = 10 }
+interactive_latency_large = { name = "Latency (large)", command = "bash -c 'for i in {1..1000}; do echo \"Line $i\"; done'", duration = 10 }
+
+# Throughput - raw bytes per second
+throughput_text = { name = "Throughput (text)", command = "cat /usr/share/dict/words", duration = 15 }
+throughput_hex = { name = "Throughput (hex)", command = "xxd /usr/bin/bash | head -5000", duration = 15 }
+
+# ANSI escape sequence stress test
+ansi_color_stress = { name = "ANSI Color Stress", command = "bash -c 'for i in {0..255}; do echo -e \"\\\\033[38;5;${i}mColor ${i}\"; done'", duration = 10 }
+ansi_cursor_movement = { name = "ANSI Cursor Movement", command = "bash -c 'for i in {1..100}; do tput cup $i 0; echo \"Line $i\"; done'", duration = 10 }
+
+# Large file rendering
+large_file = { name = "Large File", command = "cat /var/log/syslog 2>/dev/null || dmesg", duration = 30 }
+
+[thresholds]
+# FPS targets (minimum acceptable)
+fps_minimum = 30
+fps_target = 60
+fps_stretch = 144
+
+# Latency targets (maximum acceptable in ms)
+latency_maximum_ms = 50
+latency_target_ms = 16
+
+# Throughput targets
+throughput_minimum_mbps = 100
+throughput_target_mbps = 500

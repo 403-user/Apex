@@ -1,0 +1,26 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --target=$(DEB_HOST_RUST_TARGET)
+
+override_dh_auto_test:
+	cargo test --release
+
+override_dh_auto_clean:
+	cargo clean
+
+override_dh_install:
+	install -D -m 0755 target/$(DEB_HOST_RUST_TARGET)/release/apex-terminal \
+		$(CURDIR)/debian/apex-terminal/usr/bin/apex
+	install -D -m 0644 packaging/apex-terminal.desktop \
+		$(CURDIR)/debian/apex-terminal/usr/share/applications/apex-terminal.desktop
+	install -D -m 0644 packaging/apex-terminal.service \
+		$(CURDIR)/debian/apex-terminal/usr/lib/systemd/user/apex-terminal.service
+	install -D -m 0644 assets/logo.svg \
+		$(CURDIR)/debian/apex-terminal/usr/share/icons/hicolor/scalable/apps/apex-terminal.svg
+
+override_dh_strip:
+	dh_strip --dbg-package=apex-terminal-dbgsym

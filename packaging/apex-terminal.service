@@ -1,0 +1,25 @@
+[Unit]
+Description=Apex Terminal background multiplexer server
+Documentation=https://github.com/apex-terminal/apex-terminal
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/apex --server
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+LimitNPROC=4096
+CapabilityBoundingSet=~CAP_SYS_PTRACE ~CAP_SYS_ADMIN
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+MemoryMax=1G
+TasksMax=512
+
+[Install]
+WantedBy=default.target

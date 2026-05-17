@@ -1,0 +1,58 @@
+Source: apex-terminal
+Section: utils
+Priority: optional
+Maintainer: Apex Terminal Team <dev@apex-terminal.io>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc,
+               libfontconfig-dev,
+               libwayland-dev,
+               libxkbcommon-dev,
+               libegl1-mesa-dev,
+               libglib2.0-dev,
+               pkg-config,
+               cmake
+Standards-Version: 4.6.2
+Homepage: https://github.com/apex-terminal/apex-terminal
+Rules-Requires-Root: no
+
+Package: apex-terminal
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         libfontconfig1,
+         libegl1,
+         libgl1-mesa-glx,
+         libwayland-client0,
+         libxkbcommon0,
+         xdg-utils
+Recommends: kali-menu,
+            kali-defaults,
+            fonts-firacode,
+            fonts-powerline
+Suggests: sliver,
+          havoc,
+          mythic,
+          empire,
+          ollama,
+          nmap,
+          gobuster,
+          ffuf,
+          hydra,
+          metasploit-framework
+Description: Next-Generation Integrated Offensive Environment for Kali Linux
+ Apex Terminal synthesizes the high-performance rendering of Alacritty,
+ the persistent session management of Tmux, and the modular microservice
+ orchestration of modern C2 frameworks into a singular, cohesive,
+ AI-augmented platform designed specifically for Kali Linux.
+ .
+ Features:
+  - GPU-accelerated terminal rendering via wgpu/WebGPU
+  - Native terminal multiplexer with client-server architecture
+  - AI middleware with MCP protocol (local LLM inference via Ollama/Llama.cpp)
+  - C2 framework connectors: Sliver (gRPC), Havoc (WebSocket),
+    Mythic (GraphQL), Empire (REST API)
+  - Shell stabilization engine with automatic PTY spawning
+  - Tamper tracking and environment synchronization
+  - Collaborative workspace management
+  - Lua-based configuration engine

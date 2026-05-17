@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+Cargo.lock
+node_modules/
+zig-extensions/zig-cache/
+zig-extensions/zig-out/
+*.wasm
+*.swp
+*.swo
+.DS_Store
+*.log
+/tmp/apex-terminal.sock

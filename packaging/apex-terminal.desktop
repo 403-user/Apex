@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Apex Terminal
+Comment=Next-Generation Integrated Offensive Environment for Kali Linux
+TryExec=apex
+Exec=apex %F
+Icon=apex-terminal
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+Keywords=kali;terminal;offensive;security;
+StartupNotify=true
+X-Kali-Package=apex-terminal

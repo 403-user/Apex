@@ -1,0 +1,17 @@
+[package]
+name = "apex-pty"
+version = "0.1.0"
+edition = "2021"
+description = "PTY management, shell stabilization, and post-exploitation automation"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-native-tls = "0.3"
+native-tls = "0.2"
+anyhow = "1"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }

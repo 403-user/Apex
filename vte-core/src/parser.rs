@@ -10,6 +10,8 @@ pub struct VteProcessor {
     pub cursor: CursorState,
     pub mode: TerminalMode,
     pub scrollback: ScrollbackBuffer,
+    pub hyperlink_id: Option<ArrayString<64>>,
+    pub clipboard_content: Option<String>,
 }
 
 impl VteProcessor {
@@ -20,6 +22,8 @@ impl VteProcessor {
             cursor: CursorState::default(),
             mode: TerminalMode::default(),
             scrollback: ScrollbackBuffer::new(scrollback_lines),
+            hyperlink_id: None,
+            clipboard_content: None,
         }
     }
 
@@ -73,6 +77,7 @@ impl VteProcessor {
         cell.fg_color = self.cursor.fg_color;
         cell.bg_color = self.cursor.bg_color;
         cell.flags = Self::cursor_flags(&self.cursor);
+        cell.hyperlink = self.hyperlink_id.clone();
         self.grid.damage.mark_row(row);
 
         // Wide char: mark next cell as spacer
@@ -83,6 +88,7 @@ impl VteProcessor {
             next.fg_color = self.cursor.fg_color;
             next.bg_color = self.cursor.bg_color;
             next.flags = CellFlags::empty();
+            next.hyperlink = self.hyperlink_id.clone();
         }
 
         // Advance cursor by character width
@@ -630,7 +636,33 @@ impl Perform for VteProcessor {
         }
     }
 
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_term: bool) {}
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_term: bool) {
+        if params.is_empty() { return; }
+        let osc_num = std::str::from_utf8(params[0]).unwrap_or("");
+        match osc_num {
+            "8" => {
+                // OSC 8: Hyperlink — ESC ] 8 ; params ; URI ST
+                if params.len() < 3 { return; }
+                let uri = std::str::from_utf8(params[2]).unwrap_or("");
+                if uri.is_empty() {
+                    self.hyperlink_id = None;
+                } else {
+                    let mut s = ArrayString::new();
+                    s.push_str(uri);
+                    self.hyperlink_id = Some(s);
+                }
+            }
+            "52" => {
+                // OSC 52: Clipboard — ESC ] 52 ; Pc ; data ST
+                if params.len() < 3 { return; }
+                let data = std::str::from_utf8(params[2]).unwrap_or("");
+                if !data.is_empty() {
+                    self.clipboard_content = Some(data.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
 
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}

@@ -1,3 +1,4 @@
+use apex_config::theme::Theme;
 use anyhow::Result;
 use wgpu::{
     Device, Queue, Surface, SurfaceConfiguration, Instance, InstanceDescriptor,
@@ -147,6 +148,7 @@ struct ApexApp {
     debug_grid_indices: Vec<u32>,
     debug_vb: Option<wgpu::Buffer>,
     debug_ib: Option<wgpu::Buffer>,
+    theme: Theme,
     dec_vb: Option<wgpu::Buffer>,
     dec_ib: Option<wgpu::Buffer>,
     shaped_row_cache: HashMap<(u64, u16), (Vec<ShapedGlyph>, Vec<usize>, Vec<TextDirection>, Vec<usize>, u64)>,
@@ -174,7 +176,7 @@ struct ApexApp {
 }
 
 impl ApexApp {
-    fn new(scrollback_lines: u32, atlas_dump: Option<PathBuf>) -> Self {
+    fn new(scrollback_lines: u32, theme: Theme, atlas_dump: Option<PathBuf>) -> Self {
         let scrollback = scrollback_lines as usize;
         ApexApp {
             window: None,
@@ -202,6 +204,7 @@ impl ApexApp {
             output_rx: None,
             pty_reader: None,
             atlas_dump,
+            theme,
             row_cache: Vec::new(),
             render_epoch: 0,
             raster_tx: None,
@@ -608,8 +611,8 @@ impl ApexApp {
             if cell.width == 0 { continue; }
             let reverse = cell.flags.contains(CellFlags::REVERSE) ^ global_reverse;
             let dim = if cell.flags.contains(CellFlags::DIM) { 0.5 } else { 1.0 };
-            let (fg_r, fg_g, fg_b) = color_to_f32(cell.fg_color, reverse);
-            let (bg_r, bg_g, bg_b) = color_to_f32(cell.bg_color, !reverse);
+            let (fg_r, fg_g, fg_b) = color_to_f32(cell.fg_color, &self.theme, reverse);
+            let (bg_r, bg_g, bg_b) = color_to_f32(cell.bg_color, &self.theme, !reverse);
             let fg_color = [fg_r * dim, fg_g * dim, fg_b * dim, 1.0];
             let bg_color = [bg_r, bg_g, bg_b, 1.0];
 
@@ -707,9 +710,9 @@ impl ApexApp {
             if cell.width == 0 { continue; }
             let reverse = cell.flags.contains(CellFlags::REVERSE) ^ global_reverse;
             let dim = if cell.flags.contains(CellFlags::DIM) { 0.5 } else { 1.0 };
-            let (fg_r, fg_g, fg_b) = color_to_f32(cell.fg_color, reverse);
-            let (bg_r, bg_g, bg_b) = color_to_f32(cell.bg_color, !reverse);
-            let fg_color_bg = [fg_r * dim, fg_g * dim, fg_b * dim, 1.0];
+            let (fg_r, fg_g, fg_b) = color_to_f32(cell.fg_color, &self.theme, reverse);
+            let (bg_r, bg_g, bg_b) = color_to_f32(cell.bg_color, &self.theme, !reverse);
+            let _fg_color = [fg_r * dim, fg_g * dim, fg_b * dim, 1.0];
             let bg_color = [bg_r, bg_g, bg_b, 1.0];
             let x = col as f32 * cw;
             let y = row as f32 * ch;
@@ -718,12 +721,12 @@ impl ApexApp {
             let bl = px_to_ndc(x, y + ch);
             let br = px_to_ndc(x + cw, y + ch);
             bg.extend_from_slice(&[
-                GlyphVertex { position: tl, uv: [0.0; 2], fg_color: fg_color_bg, bg_color },
-                GlyphVertex { position: tr, uv: [0.0; 2], fg_color: fg_color_bg, bg_color },
-                GlyphVertex { position: bl, uv: [0.0; 2], fg_color: fg_color_bg, bg_color },
-                GlyphVertex { position: br, uv: [0.0; 2], fg_color: fg_color_bg, bg_color },
-                GlyphVertex { position: tr, uv: [0.0; 2], fg_color: fg_color_bg, bg_color },
-                GlyphVertex { position: bl, uv: [0.0; 2], fg_color: fg_color_bg, bg_color },
+                GlyphVertex { position: tl, uv: [0.0; 2], fg_color: bg_color, bg_color },
+                GlyphVertex { position: tr, uv: [0.0; 2], fg_color: bg_color, bg_color },
+                GlyphVertex { position: bl, uv: [0.0; 2], fg_color: bg_color, bg_color },
+                GlyphVertex { position: br, uv: [0.0; 2], fg_color: bg_color, bg_color },
+                GlyphVertex { position: tr, uv: [0.0; 2], fg_color: bg_color, bg_color },
+                GlyphVertex { position: bl, uv: [0.0; 2], fg_color: bg_color, bg_color },
             ]);
         }
 
@@ -861,8 +864,8 @@ impl ApexApp {
             let global_reverse = self.processor.mode.contains(vte_core::state::TerminalMode::REVERSE_VIDEO);
             let cell_reverse = cell.flags.contains(CellFlags::REVERSE) ^ global_reverse;
             let dim = if cell.flags.contains(CellFlags::DIM) { 0.5 } else { 1.0 };
-            let (fg_r, fg_g, fg_b) = color_to_f32(cell.fg_color, cell_reverse);
-            let (bg_r, bg_g, bg_b) = color_to_f32(cell.bg_color, !cell_reverse);
+            let (fg_r, fg_g, fg_b) = color_to_f32(cell.fg_color, &self.theme, cell_reverse);
+            let (bg_r, bg_g, bg_b) = color_to_f32(cell.bg_color, &self.theme, !cell_reverse);
             let fg_color = [fg_r * dim, fg_g * dim, fg_b * dim, 1.0];
             let bg_color = [bg_r, bg_g, bg_b, 1.0];
 
@@ -939,7 +942,7 @@ impl ApexApp {
                 let global_reverse = self.processor.mode.contains(vte_core::state::TerminalMode::REVERSE_VIDEO);
                 let cell_reverse = cell.flags.contains(CellFlags::REVERSE) ^ global_reverse;
                 let dim = if cell.flags.contains(CellFlags::DIM) { 0.5 } else { 1.0 };
-                let (r, g, b) = color_to_f32(cell.fg_color, cell_reverse);
+                let (r, g, b) = color_to_f32(cell.fg_color, &self.theme, cell_reverse);
                 let color = [r * dim, g * dim, b * dim, 1.0];
 
                 let x = col as f32 * cw;
@@ -1151,8 +1154,9 @@ impl ApexApp {
         let x = col as f32 * cw;
         let y = vis_row as f32 * ch;
 
-        // Cursor color: use bright white for block, fg color for beam/underline
-        let cursor_color = [0.9, 0.9, 0.9, 1.0];
+        // Cursor color from theme
+        let (cr, cg, cb) = self.theme.cursor_rgb();
+        let cursor_color = [cr, cg, cb, 1.0];
 
         match cursor.style {
             vte_core::state::CursorStyle::Block
@@ -1244,8 +1248,9 @@ impl ApexApp {
             [px * sx + ox, py * sy + oy]
         };
 
-        // Selection highlight color — semi-transparent blue
-        let sel_color = [0.2, 0.4, 0.8, 0.4];
+        // Selection highlight color from theme
+        let (sr, sg, sb) = self.theme.selection_rgb();
+        let sel_color = [sr, sg, sb, 0.4];
 
         for row in start_row..=end_row {
             let vis_row = row.saturating_sub(scrollback);
@@ -1826,39 +1831,31 @@ impl ApexApp {
     }
 }
 
-fn color_to_f32(color: vte_core::grid::Color, is_bg: bool) -> (f32, f32, f32) {
+fn color_to_f32(color: vte_core::grid::Color, theme: &Theme, is_bg: bool) -> (f32, f32, f32) {
     use vte_core::grid::Color;
     match color {
         Color::Default => {
-            if is_bg { (0.05, 0.05, 0.07) } else { (0.83, 0.83, 0.83) }
+            if is_bg { theme.background_rgb() } else { theme.foreground_rgb() }
         }
-        Color::Black => (0.0, 0.0, 0.0),
-        Color::Red => (0.80, 0.16, 0.16),
-        Color::Green => (0.0, 1.0, 0.67),
-        Color::Yellow => (0.80, 0.59, 0.0),
-        Color::Blue => (0.29, 0.62, 1.0),
-        Color::Magenta => (1.0, 0.42, 0.62),
-        Color::Cyan => (0.0, 0.80, 0.80),
-        Color::White => (0.83, 0.83, 0.83),
-        Color::BrightBlack => (0.33, 0.33, 0.33),
-        Color::BrightRed => (1.0, 0.33, 0.33),
-        Color::BrightGreen => (0.33, 1.0, 0.80),
-        Color::BrightYellow => (1.0, 1.0, 0.33),
-        Color::BrightBlue => (0.50, 0.75, 1.0),
-        Color::BrightMagenta => (1.0, 0.50, 0.75),
-        Color::BrightCyan => (0.33, 1.0, 1.0),
-        Color::BrightWhite => (1.0, 1.0, 1.0),
+        Color::Black => theme.color_rgb(0, false),
+        Color::Red => theme.color_rgb(1, false),
+        Color::Green => theme.color_rgb(2, false),
+        Color::Yellow => theme.color_rgb(3, false),
+        Color::Blue => theme.color_rgb(4, false),
+        Color::Magenta => theme.color_rgb(5, false),
+        Color::Cyan => theme.color_rgb(6, false),
+        Color::White => theme.color_rgb(7, false),
+        Color::BrightBlack => theme.color_rgb(0, true),
+        Color::BrightRed => theme.color_rgb(1, true),
+        Color::BrightGreen => theme.color_rgb(2, true),
+        Color::BrightYellow => theme.color_rgb(3, true),
+        Color::BrightBlue => theme.color_rgb(4, true),
+        Color::BrightMagenta => theme.color_rgb(5, true),
+        Color::BrightCyan => theme.color_rgb(6, true),
+        Color::BrightWhite => theme.color_rgb(7, true),
         Color::Indexed(i) => {
             if i < 16 {
-                let standard = match i {
-                    0 => Color::Black, 1 => Color::Red, 2 => Color::Green, 3 => Color::Yellow,
-                    4 => Color::Blue, 5 => Color::Magenta, 6 => Color::Cyan, 7 => Color::White,
-                    8 => Color::BrightBlack, 9 => Color::BrightRed, 10 => Color::BrightGreen,
-                    11 => Color::BrightYellow, 12 => Color::BrightBlue, 13 => Color::BrightMagenta,
-                    14 => Color::BrightCyan, 15 => Color::BrightWhite,
-                    _ => Color::BrightBlack,
-                };
-                color_to_f32(standard, is_bg)
+                theme.color_rgb(i % 8, i >= 8)
             } else if i <= 231 {
                 let idx = i - 16;
                 let r = (idx / 36) as f32 / 5.0;
@@ -1872,7 +1869,6 @@ fn color_to_f32(color: vte_core::grid::Color, is_bg: bool) -> (f32, f32, f32) {
         }
         Color::Rgb(r, g, b) => (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0),
     }
-
 }
 
 impl ApexApp {
@@ -2388,17 +2384,20 @@ impl ApplicationHandler for ApexApp {
 pub struct WgpuRenderer {
     scrollback_lines: u32,
     atlas_dump: Option<PathBuf>,
+    theme: Theme,
 }
 
 impl WgpuRenderer {
     pub async fn new(config: ApexConfig, atlas_dump: Option<PathBuf>) -> Result<Self> {
-        Ok(WgpuRenderer { scrollback_lines: config.scrollback_lines, atlas_dump })
+        let theme = Theme::from_name(&config.theme);
+        Ok(WgpuRenderer { scrollback_lines: config.scrollback_lines, atlas_dump, theme })
     }
 
     pub async fn run(&mut self) -> Result<()> {
         let event_loop = EventLoop::new()?;
         let atlas_dump = self.atlas_dump.take();
-        let mut app = ApexApp::new(self.scrollback_lines, atlas_dump);
+        let theme = self.theme.clone();
+        let mut app = ApexApp::new(self.scrollback_lines, theme, atlas_dump);
         event_loop.run_app(&mut app)?;
         Ok(())
     }

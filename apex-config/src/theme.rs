@@ -32,6 +32,74 @@ impl Default for Theme {
 }
 
 impl Theme {
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "kali-dark" | "default" => Theme::kali_dark(),
+            "backtrack" => Theme::backtrack(),
+            _ => {
+                // Try to load from file
+                let mut paths = vec![
+                    format!("/etc/apex/themes/{name}.toml"),
+                    format!("themes/{name}.toml"),
+                ];
+                if let Some(config_dir) = directories::ProjectDirs::from("com", "apex", "apex") {
+                    paths.push(config_dir.config_dir().join("themes").join(format!("{name}.toml")).to_string_lossy().to_string());
+                }
+                for path in &paths {
+                    if let Ok(content) = std::fs::read_to_string(path) {
+                        if let Ok(theme) = toml::from_str::<Theme>(&content) {
+                            return theme;
+                        }
+                    }
+                }
+                Theme::kali_dark()
+            }
+        }
+    }
+
+    /// Parse a hex color string (#rrggbb) to (f32, f32, f32)
+    pub fn parse_hex(s: &str) -> (f32, f32, f32) {
+        let s = s.trim_start_matches('#');
+        if s.len() == 6 {
+            if let Ok(r) = u8::from_str_radix(&s[0..2], 16) {
+                if let Ok(g) = u8::from_str_radix(&s[2..4], 16) {
+                    if let Ok(b) = u8::from_str_radix(&s[4..6], 16) {
+                        return (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+                    }
+                }
+            }
+        }
+        (0.0, 0.0, 0.0)
+    }
+
+    pub fn background_rgb(&self) -> (f32, f32, f32) { Self::parse_hex(&self.background) }
+    pub fn foreground_rgb(&self) -> (f32, f32, f32) { Self::parse_hex(&self.foreground) }
+    pub fn cursor_rgb(&self) -> (f32, f32, f32) { Self::parse_hex(&self.cursor) }
+    pub fn selection_rgb(&self) -> (f32, f32, f32) { Self::parse_hex(&self.selection_bg) }
+
+    pub fn color_rgb(&self, idx: u8, is_bright: bool) -> (f32, f32, f32) {
+        let s = match (idx, is_bright) {
+            (0, false) => &self.black,
+            (1, false) => &self.red,
+            (2, false) => &self.green,
+            (3, false) => &self.yellow,
+            (4, false) => &self.blue,
+            (5, false) => &self.magenta,
+            (6, false) => &self.cyan,
+            (7, false) => &self.white,
+            (0, true) => &self.bright_black,
+            (1, true) => &self.bright_red,
+            (2, true) => &self.bright_green,
+            (3, true) => &self.bright_yellow,
+            (4, true) => &self.bright_blue,
+            (5, true) => &self.bright_magenta,
+            (6, true) => &self.bright_cyan,
+            (7, true) => &self.bright_white,
+            _ => &self.white,
+        };
+        Self::parse_hex(s)
+    }
+
     pub fn kali_dark() -> Self {
         Theme {
             name: "kali-dark".into(),

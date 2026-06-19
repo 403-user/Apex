@@ -46,6 +46,7 @@ pub struct Cell {
     pub fg_color: Color,
     pub bg_color: Color,
     pub flags: CellFlags,
+    pub hyperlink: Option<ArrayString<64>>,
 }
 
 impl Default for Cell {
@@ -56,6 +57,7 @@ impl Default for Cell {
             fg_color: Color::Default,
             bg_color: Color::Default,
             flags: CellFlags::empty(),
+            hyperlink: None,
         }
     }
 }
@@ -249,5 +251,73 @@ impl Grid {
             *cell = Cell::default();
         }
         self.damage.mark_row(top);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cell_default() {
+        let cell = Cell::default();
+        assert_eq!(cell.width, 1);
+        assert!(cell.content.is_empty());
+        assert!(!cell.flags.contains(CellFlags::BOLD));
+        assert!(cell.hyperlink.is_none());
+    }
+
+    #[test]
+    fn test_cell_set_content() {
+        let mut cell = Cell::default();
+        cell.content.push('A');
+        cell.width = 1;
+        assert_eq!(cell.content.as_str(), "A");
+    }
+
+    #[test]
+    fn test_grid_new() {
+        let grid = Grid::new(24, 80);
+        assert_eq!(grid.rows.len(), 24);
+        assert_eq!(grid.cols, 80);
+        assert_eq!(grid.rows_visible, 24);
+        assert_eq!(grid.scroll_top, 0);
+        assert_eq!(grid.scroll_bottom, 23);
+    }
+
+    #[test]
+    fn test_grid_resize() {
+        let mut grid = Grid::new(24, 80);
+        grid.resize(50, 120);
+        assert_eq!(grid.rows.len(), 50);
+        assert_eq!(grid.cols, 120);
+        assert_eq!(grid.rows_visible, 50);
+    }
+
+    #[test]
+    fn test_scroll_up() {
+        let mut grid = Grid::new(4, 10);
+        let removed = grid.scroll_up(1);
+        assert_eq!(removed.len(), 1);
+    }
+
+    #[test]
+    fn test_damage_tracker() {
+        let mut tracker = DamageTracker::new(10);
+        assert!(tracker.full_redraw);
+        tracker.clear();
+        assert!(!tracker.full_redraw);
+        assert!(!tracker.any_dirty());
+        tracker.mark_row(3);
+        assert!(tracker.any_dirty());
+        assert!(tracker.dirty_rows[3]);
+    }
+
+    #[test]
+    fn test_clear_region() {
+        let mut grid = Grid::new(4, 10);
+        grid.clear_region(0, 0, 3, 9);
+        assert!(grid.rows[0].cells[0].content.is_empty());
+        assert!(grid.rows[3].cells[9].content.is_empty());
     }
 }

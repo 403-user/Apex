@@ -34,7 +34,7 @@ impl Session {
     pub fn new(name: String) -> Self {
         let main_pane = Pane {
             id: Uuid::new_v4(),
-            pty_fd: None,
+            pty_fd: None, // TODO: server should spawn PTY processes and pass fds to renderer via IPC
             rows: 24,
             cols: 80,
             scroll_offset: 0,

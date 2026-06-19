@@ -1,38 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use arrayvec::ArrayString;
+use bitflags::bitflags;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct Cell {
-    pub character: char,
-    pub fg_color: Color,
-    pub bg_color: Color,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub strikethrough: bool,
-    pub dim: bool,
-    pub reverse: bool,
-    pub hidden: bool,
-}
-
-impl Default for Cell {
-    fn default() -> Self {
-        Cell {
-            character: ' ',
-            fg_color: Color::Default,
-            bg_color: Color::Default,
-            bold: false,
-            italic: false,
-            underline: false,
-            strikethrough: false,
-            dim: false,
-            reverse: false,
-            hidden: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Color {
     Default,
     Black,
@@ -55,6 +26,40 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+bitflags! {
+    #[derive(Copy, Clone, Debug, Default, PartialEq)]
+    pub struct CellFlags: u8 {
+        const BOLD = 1 << 0;
+        const DIM = 1 << 1;
+        const ITALIC = 1 << 2;
+        const UNDERLINE = 1 << 3;
+        const REVERSE = 1 << 4;
+        const HIDDEN = 1 << 5;
+        const STRIKETHROUGH = 1 << 6;
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Cell {
+    pub content: ArrayString<32>,
+    pub width: u8,
+    pub fg_color: Color,
+    pub bg_color: Color,
+    pub flags: CellFlags,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Cell {
+            content: ArrayString::new(),
+            width: 1,
+            fg_color: Color::Default,
+            bg_color: Color::Default,
+            flags: CellFlags::empty(),
+        }
+    }
+}
+
 pub struct Row {
     pub cells: Vec<Cell>,
 }
@@ -67,8 +72,52 @@ impl Row {
     }
 }
 
+pub struct DamageTracker {
+    pub dirty_rows: Vec<bool>,
+    pub full_redraw: bool,
+}
+
+impl DamageTracker {
+    pub fn new(rows: usize) -> Self {
+        Self {
+            dirty_rows: vec![true; rows],
+            full_redraw: true,
+        }
+    }
+
+    pub fn mark_row(&mut self, row: usize) {
+        if let Some(d) = self.dirty_rows.get_mut(row) {
+            *d = true;
+        }
+    }
+
+    pub fn mark_all(&mut self) {
+        self.full_redraw = true;
+        for d in &mut self.dirty_rows {
+            *d = true;
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.full_redraw = false;
+        for d in &mut self.dirty_rows {
+            *d = false;
+        }
+    }
+
+    pub fn any_dirty(&self) -> bool {
+        self.full_redraw || self.dirty_rows.iter().any(|&d| d)
+    }
+
+    pub fn resize(&mut self, new_rows: usize) {
+        self.dirty_rows.resize(new_rows, true);
+        self.full_redraw = true;
+    }
+}
+
 pub struct Grid {
     pub rows: VecDeque<Row>,
+    pub damage: DamageTracker,
     pub cols: usize,
     pub rows_visible: usize,
     pub scroll_top: usize,
@@ -83,6 +132,7 @@ impl Grid {
         }
         Grid {
             rows: row_vec,
+            damage: DamageTracker::new(rows),
             cols,
             rows_visible: rows,
             scroll_top: 0,
@@ -109,6 +159,7 @@ impl Grid {
         self.rows_visible = new_rows;
         self.scroll_top = self.scroll_top.min(new_rows.saturating_sub(1));
         self.scroll_bottom = new_rows.saturating_sub(1);
+        self.damage.resize(new_rows);
     }
 
     pub fn scroll_up(&mut self, count: usize) -> VecDeque<Row> {
@@ -119,6 +170,13 @@ impl Grid {
                 self.rows.push_back(Row::new(self.cols));
             }
         }
+        // Rotate damage bits to stay in sync with row indices; new rows are dirty
+        let n = self.damage.dirty_rows.len();
+        let c = count.min(n);
+        self.damage.dirty_rows.rotate_left(c);
+        for i in n.saturating_sub(c)..n {
+            self.damage.dirty_rows[i] = true;
+        }
         scrolled
     }
 
@@ -127,11 +185,18 @@ impl Grid {
             self.rows.pop_back();
             self.rows.push_front(Row::new(self.cols));
         }
+        let n = self.damage.dirty_rows.len();
+        let c = count.min(n);
+        self.damage.dirty_rows.rotate_right(c);
+        for i in 0..c {
+            self.damage.dirty_rows[i] = true;
+        }
     }
 
     pub fn set_cell(&mut self, row: usize, col: usize, cell: Cell) {
         if row < self.rows.len() && col < self.cols {
             self.rows[row].cells[col] = cell;
+            self.damage.mark_row(row);
         }
     }
 
@@ -152,6 +217,7 @@ impl Grid {
             for col in start..=end {
                 self.rows[row].cells[col] = Cell::default();
             }
+            self.damage.mark_row(row);
         }
     }
 
@@ -162,10 +228,12 @@ impl Grid {
         for r in top..bottom {
             let src = self.rows[r + 1].cells.clone();
             self.rows[r].cells = src;
+            self.damage.mark_row(r);
         }
         for cell in self.rows[bottom].cells.iter_mut() {
             *cell = Cell::default();
         }
+        self.damage.mark_row(bottom);
     }
 
     pub fn scroll_region_down(&mut self, top: usize, bottom: usize) {
@@ -175,9 +243,11 @@ impl Grid {
         for r in (top + 1..=bottom).rev() {
             let src = self.rows[r - 1].cells.clone();
             self.rows[r].cells = src;
+            self.damage.mark_row(r);
         }
         for cell in self.rows[top].cells.iter_mut() {
             *cell = Cell::default();
         }
+        self.damage.mark_row(top);
     }
 }

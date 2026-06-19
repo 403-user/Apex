@@ -18,29 +18,78 @@ use winit::{
     keyboard::{Key, NamedKey},
     window::Window,
 };
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use std::os::fd::AsRawFd;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::atlas::{GlyphAtlas, GlyphVertex, ATLAS_SIZE};
+use arrayvec::ArrayString;
+use crate::atlas::{flush_uploads, GlyphAtlas, GlyphVertex, PendingUpload, RasterRequest, RasterResult, spawn_raster_worker, ATLAS_SIZE, CELL_SIZE};
+use std::collections::HashMap;
+use crate::shaper::{Shaper, TextRun, TextDirection, ShapedGlyph, VisualRun};
+use crate::font_manager::FontManager;
+use unicode_script::UnicodeScript;
+use apex_config::ApexConfig;
 use apex_pty::PtyInstance;
 use vte_core::parser::VteProcessor;
 
 const MIN_FRAME_TIME: std::time::Duration = std::time::Duration::from_millis(16); // ~60fps
+
+pub struct CachedRowMesh {
+    pub bg_vertices: Vec<GlyphVertex>,
+    pub fg_vertices: Vec<GlyphVertex>,
+    pub dec_vertices: Vec<GlyphVertex>,
+    pub generation: u64,
+}
+
+impl CachedRowMesh {
+    pub fn new() -> Self {
+        CachedRowMesh {
+            bg_vertices: Vec::new(),
+            fg_vertices: Vec::new(),
+            dec_vertices: Vec::new(),
+            generation: 0,
+        }
+    }
+}
+
+pub struct SelectionRange {
+    pub active: bool,
+    pub start_row: usize,
+    pub start_col: usize,
+    pub end_row: usize,
+    pub end_col: usize,
+}
+
+impl SelectionRange {
+    pub fn new() -> Self {
+        SelectionRange {
+            active: false,
+            start_row: 0,
+            start_col: 0,
+            end_row: 0,
+            end_col: 0,
+        }
+    }
+}
 
 struct ApexApp {
     window: Option<Arc<Window>>,
     surface: Option<Surface<'static>>,
     device: Option<Device>,
     queue: Option<Queue>,
-    config: Option<SurfaceConfiguration>,
+    surface_config: Option<SurfaceConfiguration>,
     pipeline: Option<RenderPipeline>,
+    fg_pipeline: Option<RenderPipeline>,
     bind_group: Option<wgpu::BindGroup>,
     sampler: Option<wgpu::Sampler>,
     vertex_buf: Option<wgpu::Buffer>,
     index_buf: Option<wgpu::Buffer>,
+    fg_vertex_buf: Option<wgpu::Buffer>,
+    fg_index_buf: Option<wgpu::Buffer>,
     glyph_atlas: Option<GlyphAtlas>,
     processor: VteProcessor,
     last_render: Instant,
@@ -52,24 +101,65 @@ struct ApexApp {
     input_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     output_rx: Option<mpsc::Receiver<Vec<u8>>>,
     pty_reader: Option<JoinHandle<()>>,
+    #[allow(dead_code)]
+    apex_config: ApexConfig,
+    atlas_dump: Option<PathBuf>,
+    row_cache: Vec<CachedRowMesh>,
+    render_epoch: u64,
+    raster_tx: Option<std::sync::mpsc::Sender<RasterRequest>>,
+    raster_result_rx: Option<std::sync::mpsc::Receiver<RasterResult>>,
+    pending_raster: HashSet<crate::glyph_key::GlyphKey>,
+    pending_uploads: Vec<PendingUpload>,
+    raster_worker: Option<std::thread::JoinHandle<()>>,
+    shaper: Option<Shaper>,
+    font_manager: Option<FontManager>,
+    primary_ascent: f32,
+    primary_underline_pos: f32,
+    primary_underline_thickness: f32,
+    primary_strikethrough_pos: f32,
+    primary_strikethrough_thickness: f32,
+    debug_show_overlay: bool,
+    debug_grid_vertices: Vec<GlyphVertex>,
+    debug_grid_indices: Vec<u32>,
+    debug_vb: Option<wgpu::Buffer>,
+    debug_ib: Option<wgpu::Buffer>,
+    dec_vb: Option<wgpu::Buffer>,
+    dec_ib: Option<wgpu::Buffer>,
+    shaped_row_cache: HashMap<(u64, u16), (Vec<ShapedGlyph>, Vec<usize>, Vec<TextDirection>, Vec<usize>, u64)>,
+    shaped_cache_gen: u64,
+    cursor_vertices: Vec<GlyphVertex>,
+    cursor_indices: Vec<u32>,
+    cursor_vb: Option<wgpu::Buffer>,
+    cursor_ib: Option<wgpu::Buffer>,
+    cursor_blink_visible: bool,
+    cursor_blink_accum: std::time::Duration,
+    selection: SelectionRange,
+    selection_vertices: Vec<GlyphVertex>,
+    selection_indices: Vec<u32>,
+    selection_vb: Option<wgpu::Buffer>,
+    selection_ib: Option<wgpu::Buffer>,
 }
 
 impl ApexApp {
-    fn new() -> Self {
+    fn new(apex_config: ApexConfig, atlas_dump: Option<PathBuf>) -> Self {
+        let scrollback = apex_config.scrollback_lines as usize;
         ApexApp {
             window: None,
             surface: None,
             device: None,
             queue: None,
-            config: None,
+            surface_config: None,
             pipeline: None,
+            fg_pipeline: None,
             bind_group: None,
             sampler: None,
             vertex_buf: None,
             index_buf: None,
+            fg_vertex_buf: None,
+            fg_index_buf: None,
             glyph_atlas: None,
-            processor: VteProcessor::new(24, 80, 10000),
-            last_render: Instant::now(),
+            processor: VteProcessor::new(24, 80, scrollback),
+            last_render: Instant::now() - MIN_FRAME_TIME,
             needs_redraw: true,
             cell_w: 0.0,
             cell_h: 0.0,
@@ -78,10 +168,46 @@ impl ApexApp {
             input_tx: None,
             output_rx: None,
             pty_reader: None,
+            apex_config,
+            atlas_dump,
+            row_cache: Vec::new(),
+            render_epoch: 0,
+            raster_tx: None,
+            raster_result_rx: None,
+            pending_raster: HashSet::new(),
+            pending_uploads: Vec::new(),
+            raster_worker: None,
+            shaper: None,
+            font_manager: None,
+            primary_ascent: 14.0,
+            primary_underline_pos: 2.0,
+            primary_underline_thickness: 1.5,
+            primary_strikethrough_pos: -14.0 * 0.3,
+            primary_strikethrough_thickness: 1.5,
+            debug_show_overlay: true,
+            debug_grid_vertices: Vec::new(),
+            debug_grid_indices: Vec::new(),
+            debug_vb: None,
+            debug_ib: None,
+            dec_vb: None,
+            dec_ib: None,
+            shaped_row_cache: HashMap::new(),
+            shaped_cache_gen: 0,
+            cursor_vertices: Vec::new(),
+            cursor_indices: Vec::new(),
+            cursor_vb: None,
+            cursor_ib: None,
+            cursor_blink_visible: true,
+            cursor_blink_accum: std::time::Duration::ZERO,
+            selection: SelectionRange::new(),
+            selection_vertices: Vec::new(),
+            selection_indices: Vec::new(),
+            selection_vb: None,
+            selection_ib: None,
         }
     }
 
-    fn build_pipeline(device: &Device, config: &SurfaceConfiguration, texture: &wgpu::Texture) -> (RenderPipeline, wgpu::BindGroup, wgpu::Sampler) {
+    fn build_pipelines(device: &Device, config: &SurfaceConfiguration, texture: &wgpu::Texture) -> (RenderPipeline, RenderPipeline, wgpu::BindGroup, wgpu::Sampler) {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("Terminal Shader"),
             source: ShaderSource::Wgsl(include_str!("shaders/terminal.wgsl").into()),
@@ -136,7 +262,7 @@ impl ApexApp {
             push_constant_ranges: &[],
         });
 
-        let vertex_buf_layout = VertexBufferLayout {
+        let vtx_layout = VertexBufferLayout {
             array_stride: std::mem::size_of::<GlyphVertex>() as u64,
             step_mode: VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![
@@ -147,14 +273,14 @@ impl ApexApp {
             ],
         };
 
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("Terminal Pipeline"),
+        let bg_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Terminal BG Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: VertexState {
                 module: &shader,
                 entry_point: "vs_main",
                 compilation_options: Default::default(),
-                buffers: &[vertex_buf_layout],
+                buffers: &[vtx_layout.clone()],
             },
             fragment: Some(FragmentState {
                 module: &shader,
@@ -173,17 +299,647 @@ impl ApexApp {
             cache: None,
         });
 
-        (pipeline, bind_group, sampler)
+        let fg_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Terminal FG Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                compilation_options: Default::default(),
+                buffers: &[vtx_layout.clone()],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                compilation_options: Default::default(),
+                targets: &[Some(ColorTargetState {
+                    format: config.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        (bg_pipeline, fg_pipeline, bind_group, sampler)
     }
 
-    fn build_vertex_data(&self) -> (Vec<GlyphVertex>, Vec<u16>) {
-        let rows = self.processor.grid.rows_visible;
+    fn row_is_ascii_simple(&self, row: usize) -> bool {
         let cols = self.processor.grid.cols;
-        let cw = self.cell_w.max(8.0);
-        let ch = self.cell_h.max(20.0);
+        if row >= self.processor.grid.rows.len() {
+            return true;
+        }
+        let cells = &self.processor.grid.rows[row].cells;
+        for col in 0..cols {
+            if !cells[col].content.chars().all(|c| c.is_ascii()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Compute a content fingerprint for a row for the shaped row cache.
+    fn row_fingerprint(&self, row: usize) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let cols = self.processor.grid.cols;
+        if row >= self.processor.grid.rows.len() {
+            return 0;
+        }
+        let cells = &self.processor.grid.rows[row].cells;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for col in 0..cols {
+            cells[col].content.hash(&mut hasher);
+            cells[col].flags.bits().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Resolve scripts for a grid row, inheriting Common/Inherited
+    /// from the nearest resolved script (left-to-right).
+    fn resolve_row_scripts(&self, row: usize) -> Vec<unicode_script::Script> {
+        let cols = self.processor.grid.cols;
+        if row >= self.processor.grid.rows.len() || cols == 0 {
+            return Vec::new();
+        }
+        let cells = &self.processor.grid.rows[row].cells;
+
+        let raw: Vec<unicode_script::Script> = (0..cols).map(|col| {
+            let ch = cells[col].content.chars().next().unwrap_or(' ');
+            ch.script()
+        }).collect();
+
+        let initial = raw.iter().copied()
+            .find(|s| *s != unicode_script::Script::Common
+                && *s != unicode_script::Script::Inherited)
+            .unwrap_or(unicode_script::Script::Latin);
+
+        let mut resolved = raw;
+        let mut prev = initial;
+        for s in &mut resolved {
+            if *s == unicode_script::Script::Common
+                || *s == unicode_script::Script::Inherited
+            {
+                *s = prev;
+            } else {
+                prev = *s;
+            }
+        }
+        resolved
+    }
+
+    /// Break a grid row into contiguous TextRuns grouped by style and script.
+    fn break_row_into_runs(&self, row: usize) -> Vec<TextRun> {
+        use vte_core::grid::CellFlags;
+        let cols = self.processor.grid.cols;
+        if row >= self.processor.grid.rows.len() || cols == 0 {
+            return Vec::new();
+        }
+        let cells = &self.processor.grid.rows[row].cells;
+        let scripts = self.resolve_row_scripts(row);
+
+        let cell_glyph_style = |flags: CellFlags| {
+            let mut s = crate::glyph_key::GlyphStyle::empty();
+            if flags.contains(CellFlags::BOLD) { s.insert(crate::glyph_key::GlyphStyle::BOLD); }
+            if flags.contains(CellFlags::ITALIC) { s.insert(crate::glyph_key::GlyphStyle::ITALIC); }
+            if flags.contains(CellFlags::DIM) { s.insert(crate::glyph_key::GlyphStyle::DIM); }
+            if flags.contains(CellFlags::UNDERLINE) { s.insert(crate::glyph_key::GlyphStyle::UNDERLINE); }
+            s
+        };
+
+        let mut runs: Vec<TextRun> = Vec::new();
+        let mut cur_start = 0usize;
+        let mut cur_style = cell_glyph_style(cells[0].flags);
+        let mut cur_script = scripts[0];
+        for col in 1..=cols {
+            let style_here = if col < cols { cell_glyph_style(cells[col].flags) } else { crate::glyph_key::GlyphStyle::empty() };
+            let script_here = if col < cols { scripts[col] } else { unicode_script::Script::Common };
+            if col == cols || style_here != cur_style || script_here != cur_script {
+                let mut text = ArrayString::new();
+                for c in cur_start..col {
+                    let _ = text.try_push_str(&cells[c].content);
+                }
+                let direction = match cur_script {
+                    sc if sc == unicode_script::Script::Arabic
+                        || sc == unicode_script::Script::Hebrew
+                        || sc == unicode_script::Script::Syriac
+                        || sc == unicode_script::Script::Thaana
+                        || sc == unicode_script::Script::Nko => TextDirection::Rtl,
+                    _ => TextDirection::Ltr,
+                };
+                runs.push(TextRun {
+                    row,
+                    col_start: cur_start,
+                    col_end: col,
+                    text,
+                    style: cur_style,
+                    direction,
+                    script: cur_script,
+                });
+                cur_start = col;
+                if col < cols {
+                    cur_style = style_here;
+                    cur_script = script_here;
+                }
+            }
+        }
+        runs
+    }
+
+    /// Project a logical column to its visual column using run direction data.
+    /// For LTR runs the mapping is identity; for RTL runs the column order is
+    /// reversed within the run so that the rightmost logical column maps to the
+    /// leftmost visual position (and vice versa).
+    fn logical_to_visual(&self, row: usize, logical_col: usize) -> usize {
+        let runs = self.break_row_into_runs(row);
+        for run in &runs {
+            if logical_col >= run.col_start && logical_col < run.col_end {
+                return match run.direction {
+                    TextDirection::Rtl => {
+                        run.col_start + (run.col_end - 1 - logical_col)
+                    }
+                    TextDirection::Ltr => logical_col,
+                };
+            }
+        }
+        logical_col
+    }
+
+    /// Project a visual column back to its logical column. Inverse of
+    /// `logical_to_visual`.
+    #[allow(dead_code)]
+    fn visual_to_logical(&self, row: usize, visual_col: usize) -> usize {
+        let runs = self.break_row_into_runs(row);
+        for run in &runs {
+            if visual_col >= run.col_start && visual_col < run.col_end {
+                return match run.direction {
+                    TextDirection::Rtl => {
+                        run.col_start + (run.col_end - 1 - visual_col)
+                    }
+                    TextDirection::Ltr => visual_col,
+                };
+            }
+        }
+        visual_col
+    }
+
+    /// Reorder runs from logical order into visual rendering order using
+    /// Unicode BiDi (UAX#9) level resolution. Uses per-cell first-char text
+    /// as input to `unicode_bidi::BidiInfo`, resolves embedding levels, then
+    /// reorders by L2 (via `reorder_visual`) to produce VisualRun entries with
+    /// visual-column ranges.
+    fn reorder_runs_visually(
+        &self, row: usize,
+        col_starts: &[usize],
+        col_ends: &[usize],
+        directions: &[TextDirection],
+    ) -> Vec<VisualRun> {
+        let n = col_starts.len();
+        if n <= 1 {
+            return col_starts.iter().enumerate().map(|(i, &cs)| VisualRun {
+                logical_index: i, direction: directions[i],
+                col_start: cs, col_end: col_ends[i],
+            }).collect();
+        }
+
+        let cols = self.processor.grid.cols;
+        let cells = &self.processor.grid.rows[row].cells;
+
+        // Build simplified row text: first char of each cell
+        let row_text: String = (0..cols).map(|c| {
+            cells[c].content.chars().next().unwrap_or(' ')
+        }).collect();
+
+        let bidi_info = unicode_bidi::BidiInfo::new(&row_text, Some(unicode_bidi::Level::ltr()));
+        if bidi_info.levels.len() != cols {
+            // Fallback: identity order
+            return col_starts.iter().enumerate().map(|(i, &cs)| VisualRun {
+                logical_index: i, direction: directions[i],
+                col_start: cs, col_end: col_ends[i],
+            }).collect();
+        }
+
+        // Get visual order of character indices
+        // visual_order[vis_i] = logical index of the character at visual position vis_i
+        let visual_order = unicode_bidi::BidiInfo::reorder_visual(&bidi_info.levels);
+
+        // Group consecutive visual positions by their logical run to produce
+        // VisualRun entries with visual-column ranges
+        let mut visual_runs: Vec<VisualRun> = Vec::new();
+        let mut vis_start = 0usize;
+        let mut current_run_idx: Option<usize> = None;
+
+        for vis_i in 0..cols {
+            let logical_col = visual_order[vis_i];
+            // Find which logical run contains this column
+            let run_idx = (0..n).find(|&i| {
+                logical_col >= col_starts[i] && logical_col < col_ends[i]
+            }).unwrap_or(0);
+
+            match current_run_idx {
+                Some(r) if r == run_idx => {}
+                _ => {
+                    if let Some(prev) = current_run_idx {
+                        visual_runs.push(VisualRun {
+                            logical_index: prev,
+                            direction: directions[prev],
+                            col_start: vis_start,
+                            col_end: vis_i,
+                        });
+                    }
+                    current_run_idx = Some(run_idx);
+                    vis_start = vis_i;
+                }
+            }
+        }
+        if let Some(prev) = current_run_idx {
+            visual_runs.push(VisualRun {
+                logical_index: prev,
+                direction: directions[prev],
+                col_start: vis_start,
+                col_end: cols,
+            });
+        }
+
+        visual_runs
+    }
+
+    /// Old per-cell ASCII path — loops cells individually without shaping.
+    fn render_ascii_row(
+        &self, row: usize, cw: f32, ch: f32, atlas: Option<&GlyphAtlas>,
+        px_to_ndc: &impl Fn(f32, f32) -> [f32; 2],
+    ) -> (Vec<GlyphVertex>, Vec<GlyphVertex>, Vec<crate::glyph_key::GlyphKey>)
+    {
+        use vte_core::grid::CellFlags;
+        let cols = self.processor.grid.cols;
+        if row >= self.processor.grid.rows.len() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+        let mut bg = Vec::with_capacity(cols * 6);
+        let mut fg = Vec::with_capacity(cols * 6);
+        let mut missing = Vec::new();
+        for col in 0..cols {
+            let cell = &self.processor.grid.rows[row].cells[col];
+            let reverse = cell.flags.contains(CellFlags::REVERSE);
+            let dim = if cell.flags.contains(CellFlags::DIM) { 0.5 } else { 1.0 };
+            let (fg_r, fg_g, fg_b) = color_to_f32(cell.fg_color, reverse);
+            let (bg_r, bg_g, bg_b) = color_to_f32(cell.bg_color, !reverse);
+            let fg_color = [fg_r * dim, fg_g * dim, fg_b * dim, 1.0];
+            let bg_color = [bg_r, bg_g, bg_b, 1.0];
+
+            let x = col as f32 * cw;
+            let y = row as f32 * ch;
+            let tl = px_to_ndc(x, y);
+            let tr = px_to_ndc(x + cw, y);
+            let bl = px_to_ndc(x, y + ch);
+            let br = px_to_ndc(x + cw, y + ch);
+
+            bg.extend_from_slice(&[
+                GlyphVertex { position: tl, uv: [0.0, 0.0], fg_color, bg_color },
+                GlyphVertex { position: tr, uv: [0.0, 0.0], fg_color, bg_color },
+                GlyphVertex { position: bl, uv: [0.0, 0.0], fg_color, bg_color },
+                GlyphVertex { position: br, uv: [0.0, 0.0], fg_color, bg_color },
+                GlyphVertex { position: tr, uv: [0.0, 0.0], fg_color, bg_color },
+                GlyphVertex { position: bl, uv: [0.0, 0.0], fg_color, bg_color },
+            ]);
+
+            let first_char = cell.content.chars().next().unwrap_or(' ');
+            if first_char != ' ' {
+                let key = {
+                    use ab_glyph::Font;
+                    let font = atlas.and_then(|a| a.font.as_ref());
+                    let gid = font.map(|f| f.glyph_id(first_char).0).unwrap_or(0);
+                    let font_size = atlas.map(|a| a.size).unwrap_or(14);
+                    let mut style = crate::glyph_key::GlyphStyle::empty();
+                    if cell.flags.contains(CellFlags::BOLD) { style.insert(crate::glyph_key::GlyphStyle::BOLD); }
+                    if cell.flags.contains(CellFlags::ITALIC) { style.insert(crate::glyph_key::GlyphStyle::ITALIC); }
+                    if cell.flags.contains(CellFlags::DIM) { style.insert(crate::glyph_key::GlyphStyle::DIM); }
+                    if cell.flags.contains(CellFlags::UNDERLINE) { style.insert(crate::glyph_key::GlyphStyle::UNDERLINE); }
+                    crate::glyph_key::GlyphKey::new(gid, Default::default(), font_size, style)
+                };
+                if let Some(g) = atlas.and_then(|a| a.get_glyph(&key)) {
+                    let inv = 1.0 / ATLAS_SIZE as f32;
+                    let u0 = (g.x as f32 + 0.5) * inv;
+                    let v0 = (g.y as f32 + 0.5) * inv;
+                    let u1 = (g.x as f32 + g.width as f32 - 0.5) * inv;
+                    let v1 = (g.y as f32 + g.height as f32 - 0.5) * inv;
+
+                    let baseline_y = row as f32 * ch + self.primary_ascent;
+                    let gx = col as f32 * cw + g.bearing_x;
+                    let gy = baseline_y + g.bearing_y;
+                    let gw = g.width as f32;
+                    let gh = g.height as f32;
+
+                    let ftl = px_to_ndc(gx, gy);
+                    let ftr = px_to_ndc(gx + gw, gy);
+                    let fbl = px_to_ndc(gx, gy + gh);
+                    let fbr = px_to_ndc(gx + gw, gy + gh);
+
+                    fg.extend_from_slice(&[
+                        GlyphVertex { position: ftl, uv: [u0, v0], fg_color, bg_color },
+                        GlyphVertex { position: ftr, uv: [u1, v0], fg_color, bg_color },
+                        GlyphVertex { position: fbl, uv: [u0, v1], fg_color, bg_color },
+                        GlyphVertex { position: fbr, uv: [u1, v1], fg_color, bg_color },
+                        GlyphVertex { position: ftr, uv: [u1, v0], fg_color, bg_color },
+                        GlyphVertex { position: fbl, uv: [u0, v1], fg_color, bg_color },
+                    ]);
+                } else {
+                    missing.push(key);
+                }
+            }
+        }
+        (bg, fg, missing)
+    }
+
+    /// Main row vertex builder — dispatches between ASCII fast path and
+    /// shaped text path.
+    fn build_row_vertices(&mut self, row: usize, cw: f32, ch: f32, px_to_ndc: &impl Fn(f32, f32) -> [f32; 2]) -> (Vec<GlyphVertex>, Vec<GlyphVertex>, Vec<crate::glyph_key::GlyphKey>) {
+        if row >= self.processor.grid.rows.len() {
+            return (Vec::new(), Vec::new(), Vec::new());
+        }
+
         let atlas = self.glyph_atlas.as_ref();
 
-        let (win_w, win_h) = self.config
+        let result;
+
+        // ASCII fast path — skip shaping for simple rows
+        if self.row_is_ascii_simple(row) {
+            result = self.render_ascii_row(row, cw, ch, atlas, px_to_ndc);
+        } else {
+
+        // Complex text: break into runs, shape with pen positioning
+        let cols = self.processor.grid.cols;
+        let cells = &self.processor.grid.rows[row].cells;
+
+        // Background quads — one per grid column (grid remains authoritative)
+        use vte_core::grid::CellFlags;
+        let mut bg = Vec::with_capacity(cols * 6);
+        for col in 0..cols {
+            let cell = &cells[col];
+            let reverse = cell.flags.contains(CellFlags::REVERSE);
+            let dim = if cell.flags.contains(CellFlags::DIM) { 0.5 } else { 1.0 };
+            let (fg_r, fg_g, fg_b) = color_to_f32(cell.fg_color, reverse);
+            let (bg_r, bg_g, bg_b) = color_to_f32(cell.bg_color, !reverse);
+            let fg_color_bg = [fg_r * dim, fg_g * dim, fg_b * dim, 1.0];
+            let bg_color = [bg_r, bg_g, bg_b, 1.0];
+            let x = col as f32 * cw;
+            let y = row as f32 * ch;
+            let tl = px_to_ndc(x, y);
+            let tr = px_to_ndc(x + cw, y);
+            let bl = px_to_ndc(x, y + ch);
+            let br = px_to_ndc(x + cw, y + ch);
+            bg.extend_from_slice(&[
+                GlyphVertex { position: tl, uv: [0.0; 2], fg_color: fg_color_bg, bg_color },
+                GlyphVertex { position: tr, uv: [0.0; 2], fg_color: fg_color_bg, bg_color },
+                GlyphVertex { position: bl, uv: [0.0; 2], fg_color: fg_color_bg, bg_color },
+                GlyphVertex { position: br, uv: [0.0; 2], fg_color: fg_color_bg, bg_color },
+                GlyphVertex { position: tr, uv: [0.0; 2], fg_color: fg_color_bg, bg_color },
+                GlyphVertex { position: bl, uv: [0.0; 2], fg_color: fg_color_bg, bg_color },
+            ]);
+        }
+
+        // Check the shaped row cache before shaping
+        let atlas_size = atlas.map(|a| a.size).unwrap_or(14);
+        let fingerprint = self.row_fingerprint(row);
+        let cache_key = (fingerprint, atlas_size);
+
+        let (shaped_glyphs, run_col_starts, run_directions, run_col_ends) = if self.shaped_row_cache.contains_key(&cache_key) {
+            let entry = self.shaped_row_cache.get_mut(&cache_key).unwrap();
+            entry.4 = self.shaped_cache_gen;
+            self.shaped_cache_gen += 1;
+            (entry.0.clone(), entry.1.clone(), entry.2.clone(), entry.3.clone())
+        } else {
+            let runs = self.break_row_into_runs(row);
+            let shaper = match self.shaper.as_ref() {
+                Some(s) => s,
+                None => return self.render_ascii_row(row, cw, ch, atlas, px_to_ndc),
+            };
+            let font_manager = match self.font_manager.as_ref() {
+                Some(fm) => fm,
+                None => return self.render_ascii_row(row, cw, ch, atlas, px_to_ndc),
+            };
+
+            let mut all_shaped: Vec<ShapedGlyph> = Vec::new();
+            let mut col_starts: Vec<usize> = Vec::with_capacity(runs.len());
+            let mut run_directions: Vec<TextDirection> = Vec::with_capacity(runs.len());
+            let mut col_ends: Vec<usize> = Vec::with_capacity(runs.len());
+
+            for run in &runs {
+                let mut cluster_map = Vec::with_capacity(run.text.len());
+                for c in run.col_start..run.col_end {
+                    if c >= cols { break; }
+                    let cell_bytes = cells[c].content.len().max(1);
+                    for _ in 0..cell_bytes {
+                        cluster_map.push(c);
+                    }
+                }
+
+                col_starts.push(run.col_start);
+                run_directions.push(run.direction);
+                col_ends.push(run.col_end);
+
+                // Resolve run into font-specific spans and shape each
+                let spans = font_manager.resolve_run(&run.text);
+                if spans.is_empty() {
+                    continue;
+                }
+                for span in &spans {
+                    let span_text = &run.text[span.byte_range.clone()];
+                    // Build per-span cluster map
+                    let span_cluster: Vec<usize> = cluster_map[span.byte_range.clone()].to_vec();
+                    // Build a sub-run for this span
+                    let sub_run = TextRun {
+                        row: run.row,
+                        col_start: cluster_map[span.byte_range.start],
+                        col_end: cluster_map.get(span.byte_range.end.saturating_sub(1))
+                            .copied().unwrap_or(run.col_end).saturating_add(1).min(cols),
+                        text: {
+                            let mut t = ArrayString::new();
+                            let _ = t.try_push_str(span_text);
+                            t
+                        },
+                        style: run.style,
+                        direction: run.direction,
+                        script: run.script,
+                    };
+                    if let Some(fd) = font_manager.font_data(span.font_id) {
+                        let mut shaped = shaper.shape_run(fd, span.font_id, &sub_run, &span_cluster);
+                        shaper.correct_notdef_glyphs(font_manager, &mut shaped, &sub_run, &span_cluster);
+                        all_shaped.extend(shaped);
+                    }
+                }
+            }
+
+            // Evict LRU entry if cache is full
+            if self.shaped_row_cache.len() >= 256 {
+                if let Some(evict) = self.shaped_row_cache.iter().min_by_key(|(_, v)| v.4) {
+                    let evict_key = evict.0.clone();
+                    self.shaped_row_cache.remove(&evict_key);
+                }
+            }
+
+            let gen = self.shaped_cache_gen;
+            self.shaped_cache_gen += 1;
+            self.shaped_row_cache.insert(cache_key,
+                (all_shaped.clone(), col_starts.clone(), run_directions.clone(), col_ends.clone(), gen));
+            (all_shaped, col_starts, run_directions, col_ends)
+        };
+
+        if self.debug_show_overlay {
+            log::info!("[SHAPE] row={} cache_len={} glyphs={}",
+                row, self.shaped_row_cache.len(), shaped_glyphs.len());
+            for sg in &shaped_glyphs {
+                log::info!("  glyph_id={:5} font_id={} source_col={:3} x_adv={:8.3} y_adv={:8.3} x_off={:8.3} y_off={:8.3}",
+                    sg.glyph_id, sg.font_id.0, sg.source_col, sg.x_advance, sg.y_advance, sg.x_offset, sg.y_offset);
+            }
+        }
+
+        // Build visual run order from logical run metadata using BiDi
+        let visual_runs = self.reorder_runs_visually(row, &run_col_starts, &run_col_ends, &run_directions);
+
+        // Render foreground from shaped glyphs with direction-aware pen tracking
+        let mut fg = Vec::new();
+        let mut missing = Vec::new();
+        let mut run_idx = 0usize;
+        let mut pen_x = match visual_runs.first() {
+            Some(vr) => match vr.direction {
+                TextDirection::Rtl => vr.col_end as f32 * cw,
+                TextDirection::Ltr => vr.col_start as f32 * cw,
+            },
+            None => 0.0,
+        };
+
+        for sg in &shaped_glyphs {
+            // Detect run boundary and reset pen with direction-aware start
+            while run_idx + 1 < run_col_starts.len() && sg.source_col >= run_col_starts[run_idx + 1] {
+                run_idx += 1;
+                let vr = &visual_runs[run_idx];
+                pen_x = match vr.direction {
+                    TextDirection::Rtl => vr.col_end as f32 * cw,
+                    TextDirection::Ltr => vr.col_start as f32 * cw,
+                };
+            }
+
+            if sg.source_col >= cols { continue; }
+            let cell = &cells[sg.source_col];
+            if cell.content.chars().next().unwrap_or(' ') == ' ' {
+                match visual_runs[run_idx].direction {
+                    TextDirection::Ltr => pen_x += sg.x_advance,
+                    TextDirection::Rtl => pen_x -= sg.x_advance,
+                }
+                continue;
+            }
+
+            let dim = if cell.flags.contains(CellFlags::DIM) { 0.5 } else { 1.0 };
+            let (fg_r, fg_g, fg_b) = color_to_f32(cell.fg_color, false);
+            let (bg_r, bg_g, bg_b) = color_to_f32(cell.bg_color, !cell.flags.contains(CellFlags::REVERSE));
+            let fg_color = [fg_r * dim, fg_g * dim, fg_b * dim, 1.0];
+            let bg_color = [bg_r, bg_g, bg_b, 1.0];
+
+            let mut style = crate::glyph_key::GlyphStyle::empty();
+            if cell.flags.contains(CellFlags::BOLD) { style.insert(crate::glyph_key::GlyphStyle::BOLD); }
+            if cell.flags.contains(CellFlags::ITALIC) { style.insert(crate::glyph_key::GlyphStyle::ITALIC); }
+            if cell.flags.contains(CellFlags::DIM) { style.insert(crate::glyph_key::GlyphStyle::DIM); }
+            if cell.flags.contains(CellFlags::UNDERLINE) { style.insert(crate::glyph_key::GlyphStyle::UNDERLINE); }
+
+            let key = crate::glyph_key::GlyphKey::new(sg.glyph_id, sg.font_id, atlas_size, style);
+            if let Some(atlas_g) = atlas.and_then(|a| a.get_glyph(&key)) {
+                let inv = 1.0 / ATLAS_SIZE as f32;
+                let u0 = (atlas_g.x as f32 + 0.5) * inv;
+                let v0 = (atlas_g.y as f32 + 0.5) * inv;
+                let u1 = (atlas_g.x as f32 + atlas_g.width as f32 - 0.5) * inv;
+                let v1 = (atlas_g.y as f32 + atlas_g.height as f32 - 0.5) * inv;
+
+                let baseline_y = row as f32 * ch + self.primary_ascent;
+                let gx = pen_x + sg.x_offset + atlas_g.bearing_x;
+                let gy = baseline_y + atlas_g.bearing_y + sg.y_offset;
+                let gw = atlas_g.width as f32;
+                let gh = atlas_g.height as f32;
+
+                let ftl = px_to_ndc(gx, gy);
+                let ftr = px_to_ndc(gx + gw, gy);
+                let fbl = px_to_ndc(gx, gy + gh);
+                let fbr = px_to_ndc(gx + gw, gy + gh);
+
+                fg.extend_from_slice(&[
+                    GlyphVertex { position: ftl, uv: [u0, v0], fg_color, bg_color },
+                    GlyphVertex { position: ftr, uv: [u1, v0], fg_color, bg_color },
+                    GlyphVertex { position: fbl, uv: [u0, v1], fg_color, bg_color },
+                    GlyphVertex { position: fbr, uv: [u1, v1], fg_color, bg_color },
+                    GlyphVertex { position: ftr, uv: [u1, v0], fg_color, bg_color },
+                    GlyphVertex { position: fbl, uv: [u0, v1], fg_color, bg_color },
+                ]);
+            } else {
+                missing.push(key);
+            }
+
+            // Direction-aware pen advance
+            match visual_runs[run_idx].direction {
+                TextDirection::Ltr => pen_x += sg.x_advance,
+                TextDirection::Rtl => pen_x -= sg.x_advance,
+            }
+        }
+
+        result = (bg, fg, missing);
+        }
+
+        // Generate decoration overlay quads (underline/strikethrough) — common to both paths
+        use vte_core::grid::CellFlags;
+        let cols = self.processor.grid.cols;
+        let cells = &self.processor.grid.rows[row].cells;
+        let baseline_y = row as f32 * ch + self.primary_ascent;
+        let underline_y = baseline_y + self.primary_underline_pos;
+        let underline_h = self.primary_underline_thickness;
+        let strikethrough_y = baseline_y + self.primary_strikethrough_pos;
+        let strikethrough_h = self.primary_strikethrough_thickness;
+
+        let mut dec = Vec::new();
+        for col in 0..cols {
+            if col >= cells.len() { break; }
+            let cell = &cells[col];
+
+            let style = if cell.flags.contains(CellFlags::STRIKETHROUGH) {
+                Some((strikethrough_y, strikethrough_h))
+            } else if cell.flags.contains(CellFlags::UNDERLINE) {
+                Some((underline_y, underline_h))
+            } else {
+                None
+            };
+
+            if let Some((dec_y, dec_h)) = style {
+                let dim = if cell.flags.contains(CellFlags::DIM) { 0.5 } else { 1.0 };
+                let (r, g, b) = color_to_f32(cell.fg_color, cell.flags.contains(CellFlags::REVERSE));
+                let color = [r * dim, g * dim, b * dim, 1.0];
+
+                let x = col as f32 * cw;
+                let tl = px_to_ndc(x, dec_y);
+                let tr = px_to_ndc(x + cw, dec_y);
+                let bl = px_to_ndc(x, dec_y + dec_h);
+                let br = px_to_ndc(x + cw, dec_y + dec_h);
+
+                dec.extend_from_slice(&[
+                    GlyphVertex { position: tl, uv: [0.0; 2], fg_color: color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color: color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color: color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: br, uv: [0.0; 2], fg_color: color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color: color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color: color, bg_color: [0.0; 4] },
+                ]);
+            }
+        }
+        self.row_cache[row].dec_vertices = dec;
+
+        result
+    }
+
+    fn build_vertex_data(&mut self) -> (Vec<GlyphVertex>, Vec<GlyphVertex>, Vec<u32>, Vec<u32>, Vec<GlyphVertex>, Vec<u32>) {
+        let rows = self.processor.grid.rows_visible;
+        let cw = self.cell_w.max(8.0);
+        let ch = self.cell_h.max(20.0);
+        let (win_w, win_h) = self.surface_config
             .as_ref()
             .map(|c| (c.width as f32, c.height as f32))
             .unwrap_or((960.0, 540.0));
@@ -196,73 +952,322 @@ impl ApexApp {
             [px * sx + ox, py * sy + oy]
         };
 
-        let capacity = rows.saturating_mul(cols).saturating_mul(6);
-        let mut vertices = Vec::with_capacity(capacity);
-        let mut indices = Vec::with_capacity(capacity);
+        // Resize cache to match grid
+        self.row_cache.resize_with(rows, CachedRowMesh::new);
 
+        // Copy damage state to avoid borrow conflict with mutable build_row_vertices
+        let full_redraw = self.processor.grid.damage.full_redraw;
+        let dirty_rows = self.processor.grid.damage.dirty_rows.clone();
+
+        // Rebuild only dirty rows
+        let mut missing_set = HashSet::new();
         for row in 0..rows {
-            for col in 0..cols {
-                if row >= self.processor.grid.rows.len() || col >= self.processor.grid.cols {
-                    continue;
-                }
-                let cell = &self.processor.grid.rows[row].cells[col];
-                let (fg_r, fg_g, fg_b) = color_to_f32(cell.fg_color, cell.reverse);
-                let (bg_r, bg_g, bg_b) = color_to_f32(cell.bg_color, !cell.reverse);
-                let dim = if cell.dim { 0.5 } else { 1.0 };
-                let fg_color = [fg_r * dim, fg_g * dim, fg_b * dim, 1.0];
-                let bg_color = [bg_r, bg_g, bg_b, 1.0];
-
-                let x = col as f32 * cw;
-                let y = row as f32 * ch;
-                let (w, h) = (cw, ch);
-                let tl = px_to_ndc(x, y);
-                let tr = px_to_ndc(x + w, y);
-                let bl = px_to_ndc(x, y + h);
-                let br = px_to_ndc(x + w, y + h);
-
-                // Background quad (no glyph texture, use a zero UV)
-                vertices.extend_from_slice(&[
-                    GlyphVertex { position: tl, uv: [0.0, 0.0], fg_color, bg_color },
-                    GlyphVertex { position: tr, uv: [0.0, 0.0], fg_color, bg_color },
-                    GlyphVertex { position: bl, uv: [0.0, 0.0], fg_color, bg_color },
-                    GlyphVertex { position: br, uv: [0.0, 0.0], fg_color, bg_color },
-                    GlyphVertex { position: tr, uv: [0.0, 0.0], fg_color, bg_color },
-                    GlyphVertex { position: bl, uv: [0.0, 0.0], fg_color, bg_color },
-                ]);
-
-                // Foreground quad with glyph texture
-                if cell.character != ' ' {
-                    let glyph_uv = atlas.and_then(|a| a.get_glyph(cell.character, 14)).map(|g| {
-                        let u0 = g.x as f32 / ATLAS_SIZE as f32;
-                        let v0 = g.y as f32 / ATLAS_SIZE as f32;
-                        let u1 = (g.x + g.width) as f32 / ATLAS_SIZE as f32;
-                        let v1 = (g.y + g.height) as f32 / ATLAS_SIZE as f32;
-                        (u0, v0, u1, v1)
-                    }).unwrap_or((0.0, 0.0, 0.0, 0.0));
-
-                    let (u0, v0, u1, v1) = glyph_uv;
-                    vertices.extend_from_slice(&[
-                        GlyphVertex { position: tl, uv: [u0, v0], fg_color, bg_color },
-                        GlyphVertex { position: tr, uv: [u1, v0], fg_color, bg_color },
-                        GlyphVertex { position: bl, uv: [u0, v1], fg_color, bg_color },
-                        GlyphVertex { position: br, uv: [u1, v1], fg_color, bg_color },
-                        GlyphVertex { position: tr, uv: [u1, v0], fg_color, bg_color },
-                        GlyphVertex { position: bl, uv: [u0, v1], fg_color, bg_color },
-                    ]);
+            if full_redraw || dirty_rows.get(row).copied().unwrap_or(true) {
+                let (bg, fg, missing) = self.build_row_vertices(row, cw, ch, &px_to_ndc);
+                self.row_cache[row].bg_vertices = bg;
+                self.row_cache[row].fg_vertices = fg;
+                self.row_cache[row].generation = self.render_epoch;
+                for key in missing {
+                    missing_set.insert(key);
                 }
             }
         }
 
-        let count = vertices.len().min(u16::MAX as usize);
-        for i in 0..count as u16 {
-            indices.push(i);
+        // Send raster requests for missing glyphs that aren't already pending
+        for key in missing_set {
+            if self.pending_raster.insert(key.clone()) {
+                let font = self.glyph_atlas.as_ref().and_then(|a| a.font.clone());
+                let size = self.glyph_atlas.as_ref().map(|a| a.size).unwrap_or(14);
+                if let (Some(f), Some(ref tx)) = (font, self.raster_tx.as_ref()) {
+                    let _ = tx.send(RasterRequest { key, font: f, size });
+                }
+            }
         }
 
-        (vertices, indices)
+        // Concatenate all cached rows into bg, fg, and decoration lists
+        let bg_total: usize = self.row_cache.iter().map(|r| r.bg_vertices.len()).sum();
+        let fg_total: usize = self.row_cache.iter().map(|r| r.fg_vertices.len()).sum();
+        let dec_total: usize = self.row_cache.iter().map(|r| r.dec_vertices.len()).sum();
+        let mut bg_vertices = Vec::with_capacity(bg_total);
+        let mut fg_vertices = Vec::with_capacity(fg_total);
+        let mut dec_vertices = Vec::with_capacity(dec_total);
+        for cached in &self.row_cache {
+            bg_vertices.extend_from_slice(&cached.bg_vertices);
+            fg_vertices.extend_from_slice(&cached.fg_vertices);
+            dec_vertices.extend_from_slice(&cached.dec_vertices);
+        }
+
+        let bg_indices: Vec<u32> = (0..bg_vertices.len() as u32).collect();
+        let fg_indices: Vec<u32> = (0..fg_vertices.len() as u32).collect();
+        let dec_indices: Vec<u32> = (0..dec_vertices.len() as u32).collect();
+
+        // Debug grid overlay — semi-transparent cell boundary lines + baseline
+        self.debug_grid_vertices.clear();
+        self.debug_grid_indices.clear();
+        if self.debug_show_overlay {
+            let cols = self.processor.grid.cols;
+            let fg_color = [1.0, 0.3, 0.1, 0.25];
+            let bg_color = [0.0; 4];
+            let baseline_color = [0.3, 0.6, 1.0, 0.35];
+            let half_px = 0.5;
+
+            // Horizontal lines (cell boundaries)
+            for r in 0..=rows {
+                let y = r as f32 * ch;
+                let x0 = 0.0;
+                let x1 = cols as f32 * cw;
+                let tl = px_to_ndc(x0, y - half_px);
+                let tr = px_to_ndc(x1, y - half_px);
+                let bl = px_to_ndc(x0, y + half_px);
+                let br = px_to_ndc(x1, y + half_px);
+                let base = self.debug_grid_vertices.len() as u32;
+                self.debug_grid_vertices.extend_from_slice(&[
+                    GlyphVertex { position: tl, uv: [0.0; 2], fg_color, bg_color },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color, bg_color },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color, bg_color },
+                    GlyphVertex { position: br, uv: [0.0; 2], fg_color, bg_color },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color, bg_color },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color, bg_color },
+                ]);
+                self.debug_grid_indices.extend_from_slice(&[base, base+1, base+2, base+3, base+1, base+2]);
+            }
+
+            // Baseline lines (one per row, blue highlight)
+            for r in 0..rows {
+                let y = r as f32 * ch + self.primary_ascent;
+                let x0 = 0.0;
+                let x1 = cols as f32 * cw;
+                let tl = px_to_ndc(x0, y - half_px);
+                let tr = px_to_ndc(x1, y - half_px);
+                let bl = px_to_ndc(x0, y + half_px);
+                let br = px_to_ndc(x1, y + half_px);
+                let base = self.debug_grid_vertices.len() as u32;
+                self.debug_grid_vertices.extend_from_slice(&[
+                    GlyphVertex { position: tl, uv: [0.0; 2], fg_color: baseline_color, bg_color },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color: baseline_color, bg_color },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color: baseline_color, bg_color },
+                    GlyphVertex { position: br, uv: [0.0; 2], fg_color: baseline_color, bg_color },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color: baseline_color, bg_color },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color: baseline_color, bg_color },
+                ]);
+                self.debug_grid_indices.extend_from_slice(&[base, base+1, base+2, base+3, base+1, base+2]);
+            }
+
+            // Vertical lines
+            for c in 0..=cols {
+                let x = c as f32 * cw;
+                let y0 = 0.0;
+                let y1 = rows as f32 * ch;
+                let tl = px_to_ndc(x - half_px, y0);
+                let tr = px_to_ndc(x + half_px, y0);
+                let bl = px_to_ndc(x - half_px, y1);
+                let br = px_to_ndc(x + half_px, y1);
+                let base = self.debug_grid_vertices.len() as u32;
+                self.debug_grid_vertices.extend_from_slice(&[
+                    GlyphVertex { position: tl, uv: [0.0; 2], fg_color, bg_color },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color, bg_color },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color, bg_color },
+                    GlyphVertex { position: br, uv: [0.0; 2], fg_color, bg_color },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color, bg_color },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color, bg_color },
+                ]);
+                self.debug_grid_indices.extend_from_slice(&[base, base+1, base+2, base+3, base+1, base+2]);
+            }
+        }
+
+        (bg_vertices, fg_vertices, bg_indices, fg_indices, dec_vertices, dec_indices)
+    }
+
+    /// Build cursor overlay geometry — pure overlay, no row/shape cache invalidation.
+    fn build_cursor_overlay(&mut self, cw: f32, ch: f32) {
+        self.cursor_vertices.clear();
+        self.cursor_indices.clear();
+
+        let cursor = &self.processor.cursor;
+        let is_visible = self.processor.mode.contains(vte_core::state::TerminalMode::CURSOR_VISIBLE);
+        if !is_visible { return; }
+
+        // Determine blink state
+        let is_blinking = match cursor.style {
+            vte_core::state::CursorStyle::BlinkingBlock
+            | vte_core::state::CursorStyle::BlinkingUnderline
+            | vte_core::state::CursorStyle::BlinkingBeam => true,
+            _ => self.processor.mode.contains(vte_core::state::TerminalMode::CURSOR_BLINK),
+        };
+        if is_blinking && !self.cursor_blink_visible { return; }
+
+        // Map cursor row to visible row index
+        let rows = self.processor.grid.rows.len();
+        let visible = self.processor.grid.rows_visible;
+        let scrollback = rows.saturating_sub(visible);
+        let vis_row = cursor.row.saturating_sub(scrollback);
+        let logical_col = cursor.col;
+
+        if vis_row >= visible || logical_col >= self.processor.grid.cols { return; }
+
+        // Project cursor from logical column to visual column
+        let col = self.logical_to_visual(cursor.row, logical_col);
+
+        let (win_w, win_h) = self.surface_config
+            .as_ref()
+            .map(|c| (c.width as f32, c.height as f32))
+            .unwrap_or((960.0, 540.0));
+        let sx = 2.0 / win_w;
+        let sy = -2.0 / win_h;
+        let ox = -1.0;
+        let oy = 1.0;
+        let px_to_ndc = |px: f32, py: f32| -> [f32; 2] {
+            [px * sx + ox, py * sy + oy]
+        };
+
+        let x = col as f32 * cw;
+        let y = vis_row as f32 * ch;
+
+        // Cursor color: use bright white for block, fg color for beam/underline
+        let cursor_color = [0.9, 0.9, 0.9, 1.0];
+
+        match cursor.style {
+            vte_core::state::CursorStyle::Block
+            | vte_core::state::CursorStyle::BlinkingBlock => {
+                let tl = px_to_ndc(x, y);
+                let tr = px_to_ndc(x + cw, y);
+                let bl = px_to_ndc(x, y + ch);
+                let br = px_to_ndc(x + cw, y + ch);
+                self.cursor_vertices.extend_from_slice(&[
+                    GlyphVertex { position: tl, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: br, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                ]);
+                self.cursor_indices.extend(0..6);
+            }
+            vte_core::state::CursorStyle::Underline
+            | vte_core::state::CursorStyle::BlinkingUnderline => {
+                let ul_y = y + ch - 3.0;
+                let ul_h = 2.0f32;
+                let tl = px_to_ndc(x, ul_y);
+                let tr = px_to_ndc(x + cw, ul_y);
+                let bl = px_to_ndc(x, ul_y + ul_h);
+                let br = px_to_ndc(x + cw, ul_y + ul_h);
+                self.cursor_vertices.extend_from_slice(&[
+                    GlyphVertex { position: tl, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: br, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                ]);
+                self.cursor_indices.extend(0..6);
+            }
+            vte_core::state::CursorStyle::Beam
+            | vte_core::state::CursorStyle::BlinkingBeam => {
+                let beam_w = 2.0f32;
+                let tl = px_to_ndc(x, y);
+                let tr = px_to_ndc(x + beam_w, y);
+                let bl = px_to_ndc(x, y + ch);
+                let br = px_to_ndc(x + beam_w, y + ch);
+                self.cursor_vertices.extend_from_slice(&[
+                    GlyphVertex { position: tl, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: br, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color: cursor_color, bg_color: [0.0; 4] },
+                ]);
+                self.cursor_indices.extend(0..6);
+            }
+        }
+    }
+
+    /// Build selection overlay geometry — full-cell quads for selected range.
+    fn build_selection_overlay(&mut self, cw: f32, ch: f32) {
+        self.selection_vertices.clear();
+        self.selection_indices.clear();
+
+        if !self.selection.active { return; }
+
+        let rows = self.processor.grid.rows.len();
+        let visible = self.processor.grid.rows_visible;
+        let cols = self.processor.grid.cols;
+        let scrollback = rows.saturating_sub(visible);
+
+        let mut start_row = self.selection.start_row;
+        let mut start_col = self.selection.start_col;
+        let mut end_row = self.selection.end_row;
+        let mut end_col = self.selection.end_col;
+
+        // Clamp to grid
+        if start_row >= rows { start_row = rows.saturating_sub(1); }
+        if end_row >= rows { end_row = rows.saturating_sub(1); }
+        if start_col >= cols { start_col = cols.saturating_sub(1); }
+        if end_col >= cols { end_col = cols.saturating_sub(1); }
+
+        let (win_w, win_h) = self.surface_config
+            .as_ref()
+            .map(|c| (c.width as f32, c.height as f32))
+            .unwrap_or((960.0, 540.0));
+        let sx = 2.0 / win_w;
+        let sy = -2.0 / win_h;
+        let ox = -1.0;
+        let oy = 1.0;
+        let px_to_ndc = |px: f32, py: f32| -> [f32; 2] {
+            [px * sx + ox, py * sy + oy]
+        };
+
+        // Selection highlight color — semi-transparent blue
+        let sel_color = [0.2, 0.4, 0.8, 0.4];
+
+        for row in start_row..=end_row {
+            let vis_row = row.saturating_sub(scrollback);
+            if vis_row >= visible { continue; }
+
+            let is_first_row = row == start_row;
+            let is_last_row = row == end_row;
+            let r_start_c = if is_first_row { start_col } else { 0 };
+            let r_end_c = if is_last_row { end_col } else { cols.saturating_sub(1) };
+
+            for logical_col in r_start_c..=r_end_c {
+                // Project logical column to visual column for RTL-aware positioning
+                let col = self.logical_to_visual(row, logical_col);
+                let x = col as f32 * cw;
+                let y = vis_row as f32 * ch;
+                let tl = px_to_ndc(x, y);
+                let tr = px_to_ndc(x + cw, y);
+                let bl = px_to_ndc(x, y + ch);
+                let br = px_to_ndc(x + cw, y + ch);
+                self.selection_vertices.extend_from_slice(&[
+                    GlyphVertex { position: tl, uv: [0.0; 2], fg_color: sel_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color: sel_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color: sel_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: br, uv: [0.0; 2], fg_color: sel_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: tr, uv: [0.0; 2], fg_color: sel_color, bg_color: [0.0; 4] },
+                    GlyphVertex { position: bl, uv: [0.0; 2], fg_color: sel_color, bg_color: [0.0; 4] },
+                ]);
+                self.selection_indices.extend(0..6);
+            }
+        }
     }
 
     fn render(&mut self) {
+        // Flush staged uploads before building vertex data
+        if !self.pending_uploads.is_empty() {
+            let pending = std::mem::take(&mut self.pending_uploads);
+            if let (Some(ref device), Some(ref queue)) = (&self.device, &self.queue) {
+                if let Some(ref mut atlas) = self.glyph_atlas {
+                    flush_uploads(device, queue, atlas, pending);
+                }
+            }
+        }
+
         if !self.needs_redraw {
+            return;
+        }
+
+        // Skip if nothing actually changed in the grid
+        if !self.processor.grid.damage.any_dirty() {
+            self.needs_redraw = false;
             return;
         }
 
@@ -273,52 +1278,193 @@ impl ApexApp {
         }
         self.last_render = now;
 
-        let (surface, device, queue, config, pipeline, bind_group) = match (
-            &self.surface, &self.device, &self.queue, &self.config,
-            &self.pipeline, &self.bind_group,
-        ) {
-            (Some(s), Some(d), Some(q), Some(c), Some(p), Some(bg)) => (s, d, q, c, p, bg),
-            _ => { self.needs_redraw = true; return; }
-        };
-
-        let (vertices, indices) = self.build_vertex_data();
-        if vertices.is_empty() {
+        // Build vertex data BEFORE borrowing self fields
+        let (bg_vertices, fg_vertices, bg_indices, fg_indices, dec_vertices, dec_indices) = self.build_vertex_data();
+        self.build_cursor_overlay(self.cell_w, self.cell_h);
+        self.build_selection_overlay(self.cell_w, self.cell_h);
+        if bg_vertices.is_empty() && fg_vertices.is_empty() && dec_vertices.is_empty()
+            && self.cursor_vertices.is_empty() && self.selection_indices.is_empty() {
             log::warn!("No vertices to render");
             self.needs_redraw = false;
+            self.processor.grid.damage.clear();
             return;
         }
 
-        // Upload vertex data
-        let vert_bytes = bytemuck::cast_slice(&vertices);
-        let idx_bytes = bytemuck::cast_slice(&indices);
+        let (surface, device, queue, config, bg_pipeline, fg_pipeline, bind_group) = match (
+            &self.surface, &self.device, &self.queue, &self.surface_config,
+            &self.pipeline, &self.fg_pipeline, &self.bind_group,
+        ) {
+            (Some(s), Some(d), Some(q), Some(c), Some(bp), Some(fp), Some(bg)) => (s, d, q, c, bp, fp, bg),
+            _ => { self.needs_redraw = true; return; }
+        };
 
-        if self.vertex_buf.as_ref().map_or(true, |vb| vb.size() < vert_bytes.len() as u64) {
+        // Upload background vertex data
+        let bg_vert_bytes = bytemuck::cast_slice(&bg_vertices);
+        let bg_idx_bytes = bytemuck::cast_slice(&bg_indices);
+
+        if self.vertex_buf.as_ref().map_or(true, |vb| vb.size() < bg_vert_bytes.len() as u64) {
             self.vertex_buf = Some(device.create_buffer(&BufferDescriptor {
-                label: Some("Terminal Verts"),
-                size: vert_bytes.len().max(1024) as u64,
+                label: Some("Terminal BG Verts"),
+                size: bg_vert_bytes.len().max(1024) as u64,
                 usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
         }
-        let Some(vb) = self.vertex_buf.as_ref() else {
+        let Some(bg_vb) = self.vertex_buf.as_ref() else {
             self.needs_redraw = true;
             return;
         };
-        queue.write_buffer(vb, 0, vert_bytes);
+        queue.write_buffer(bg_vb, 0, bg_vert_bytes);
 
-        if self.index_buf.as_ref().map_or(true, |ib| ib.size() < idx_bytes.len() as u64) {
+        if self.index_buf.as_ref().map_or(true, |ib| ib.size() < bg_idx_bytes.len() as u64) {
             self.index_buf = Some(device.create_buffer(&BufferDescriptor {
-                label: Some("Terminal Idx"),
-                size: idx_bytes.len().max(1024) as u64,
+                label: Some("Terminal BG Idx"),
+                size: bg_idx_bytes.len().max(1024) as u64,
                 usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
         }
-        let Some(ib) = self.index_buf.as_ref() else {
+        let Some(bg_ib) = self.index_buf.as_ref() else {
             self.needs_redraw = true;
             return;
         };
-        queue.write_buffer(ib, 0, idx_bytes);
+        queue.write_buffer(bg_ib, 0, bg_idx_bytes);
+
+        // Upload foreground vertex data
+        let fg_vert_bytes = bytemuck::cast_slice(&fg_vertices);
+        let fg_idx_bytes = bytemuck::cast_slice(&fg_indices);
+
+        if self.fg_vertex_buf.as_ref().map_or(true, |vb| vb.size() < fg_vert_bytes.len() as u64) {
+            self.fg_vertex_buf = Some(device.create_buffer(&BufferDescriptor {
+                label: Some("Terminal FG Verts"),
+                size: fg_vert_bytes.len().max(1024) as u64,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let Some(fg_vb) = self.fg_vertex_buf.as_ref() else {
+            self.needs_redraw = true;
+            return;
+        };
+        queue.write_buffer(fg_vb, 0, fg_vert_bytes);
+
+        if self.fg_index_buf.as_ref().map_or(true, |ib| ib.size() < fg_idx_bytes.len() as u64) {
+            self.fg_index_buf = Some(device.create_buffer(&BufferDescriptor {
+                label: Some("Terminal FG Idx"),
+                size: fg_idx_bytes.len().max(1024) as u64,
+                usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let Some(fg_ib) = self.fg_index_buf.as_ref() else {
+            self.needs_redraw = true;
+            return;
+        };
+        queue.write_buffer(fg_ib, 0, fg_idx_bytes);
+
+        // Upload decoration overlay vertex data
+        if !dec_indices.is_empty() {
+            let dec_vert_bytes = bytemuck::cast_slice(&dec_vertices);
+            let dec_idx_bytes = bytemuck::cast_slice(&dec_indices);
+            if self.dec_vb.as_ref().map_or(true, |vb| vb.size() < dec_vert_bytes.len() as u64) {
+                self.dec_vb = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("Terminal Decoration Verts"),
+                    size: dec_vert_bytes.len().max(1024) as u64,
+                    usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            if self.dec_ib.as_ref().map_or(true, |ib| ib.size() < dec_idx_bytes.len() as u64) {
+                self.dec_ib = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("Terminal Decoration Idx"),
+                    size: dec_idx_bytes.len().max(1024) as u64,
+                    usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            if let (Some(ref d_vb), Some(ref d_ib)) = (&self.dec_vb, &self.dec_ib) {
+                queue.write_buffer(d_vb, 0, dec_vert_bytes);
+                queue.write_buffer(d_ib, 0, dec_idx_bytes);
+            }
+        }
+
+        // Upload cursor overlay vertex data
+        if !self.cursor_indices.is_empty() {
+            let cur_vert_bytes = bytemuck::cast_slice(&self.cursor_vertices);
+            let cur_idx_bytes = bytemuck::cast_slice(&self.cursor_indices);
+            if self.cursor_vb.as_ref().map_or(true, |vb| vb.size() < cur_vert_bytes.len() as u64) {
+                self.cursor_vb = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("Cursor Verts"),
+                    size: cur_vert_bytes.len().max(64) as u64,
+                    usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            if self.cursor_ib.as_ref().map_or(true, |ib| ib.size() < cur_idx_bytes.len() as u64) {
+                self.cursor_ib = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("Cursor Idx"),
+                    size: cur_idx_bytes.len().max(64) as u64,
+                    usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            if let (Some(ref cvb), Some(ref cib)) = (&self.cursor_vb, &self.cursor_ib) {
+                queue.write_buffer(cvb, 0, cur_vert_bytes);
+                queue.write_buffer(cib, 0, cur_idx_bytes);
+            }
+        }
+
+        // Upload selection overlay vertex data
+        if !self.selection_indices.is_empty() {
+            let sel_vert_bytes = bytemuck::cast_slice(&self.selection_vertices);
+            let sel_idx_bytes = bytemuck::cast_slice(&self.selection_indices);
+            if self.selection_vb.as_ref().map_or(true, |vb| vb.size() < sel_vert_bytes.len() as u64) {
+                self.selection_vb = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("Selection Verts"),
+                    size: sel_vert_bytes.len().max(64) as u64,
+                    usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            if self.selection_ib.as_ref().map_or(true, |ib| ib.size() < sel_idx_bytes.len() as u64) {
+                self.selection_ib = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("Selection Idx"),
+                    size: sel_idx_bytes.len().max(64) as u64,
+                    usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            if let (Some(ref svb), Some(ref sib)) = (&self.selection_vb, &self.selection_ib) {
+                queue.write_buffer(svb, 0, sel_vert_bytes);
+                queue.write_buffer(sib, 0, sel_idx_bytes);
+            }
+        }
+
+        // Upload debug grid overlay
+        if self.debug_show_overlay && !self.debug_grid_indices.is_empty() {
+            let dbg_vert_bytes = bytemuck::cast_slice(&self.debug_grid_vertices);
+            let dbg_idx_bytes = bytemuck::cast_slice(&self.debug_grid_indices);
+            if self.debug_vb.as_ref().map_or(true, |vb| vb.size() < dbg_vert_bytes.len() as u64) {
+                self.debug_vb = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("Debug Grid Verts"),
+                    size: dbg_vert_bytes.len().max(1024) as u64,
+                    usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            if self.debug_ib.as_ref().map_or(true, |ib| ib.size() < dbg_idx_bytes.len() as u64) {
+                self.debug_ib = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("Debug Grid Idx"),
+                    size: dbg_idx_bytes.len().max(1024) as u64,
+                    usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            if let (Some(ref dbg_vb), Some(ref dbg_ib)) = (&self.debug_vb, &self.debug_ib) {
+                queue.write_buffer(dbg_vb, 0, dbg_vert_bytes);
+                queue.write_buffer(dbg_ib, 0, dbg_idx_bytes);
+            }
+        }
 
         let frame = match surface.get_current_texture() {
             Ok(frame) => frame,
@@ -354,16 +1500,101 @@ impl ApexApp {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            rp.set_pipeline(pipeline);
-            rp.set_bind_group(0, bind_group, &[]);
-            rp.set_vertex_buffer(0, vb.slice(..));
-            rp.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint16);
-            rp.draw_indexed(0..indices.len() as u32, 0, 0..1);
+
+            // Background layer — solid fills
+            if !bg_indices.is_empty() {
+                rp.set_pipeline(bg_pipeline);
+                rp.set_bind_group(0, bind_group, &[]);
+                rp.set_vertex_buffer(0, bg_vb.slice(..));
+                rp.set_index_buffer(bg_ib.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..bg_indices.len() as u32, 0, 0..1);
+            }
+
+            // Decoration overlay — underline/strikethrough between BG and FG
+            if !dec_indices.is_empty() {
+                if let (Some(ref d_vb), Some(ref d_ib)) = (&self.dec_vb, &self.dec_ib) {
+                    rp.set_pipeline(bg_pipeline);
+                    rp.set_bind_group(0, bind_group, &[]);
+                    rp.set_vertex_buffer(0, d_vb.slice(..));
+                    rp.set_index_buffer(d_ib.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..dec_indices.len() as u32, 0, 0..1);
+                }
+            }
+
+            // Selection overlay — rendered between decoration and block cursor so selection
+            // highlight sits behind text but overrides cell backgrounds
+            if !self.selection_indices.is_empty() {
+                if let (Some(ref svb), Some(ref sib)) = (&self.selection_vb, &self.selection_ib) {
+                    rp.set_pipeline(bg_pipeline);
+                    rp.set_bind_group(0, bind_group, &[]);
+                    rp.set_vertex_buffer(0, svb.slice(..));
+                    rp.set_index_buffer(sib.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..self.selection_indices.len() as u32, 0, 0..1);
+                }
+            }
+
+            // Block cursor — rendered BEFORE FG so text shows on top
+            if !self.cursor_indices.is_empty() {
+                let is_block = matches!(self.processor.cursor.style,
+                    vte_core::state::CursorStyle::Block
+                    | vte_core::state::CursorStyle::BlinkingBlock);
+                if is_block {
+                    if let (Some(ref cvb), Some(ref cib)) = (&self.cursor_vb, &self.cursor_ib) {
+                        rp.set_pipeline(bg_pipeline);
+                        rp.set_bind_group(0, bind_group, &[]);
+                        rp.set_vertex_buffer(0, cvb.slice(..));
+                        rp.set_index_buffer(cib.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.draw_indexed(0..self.cursor_indices.len() as u32, 0, 0..1);
+                    }
+                }
+            }
+
+            // Foreground layer — glyphs with alpha blending
+            if !fg_indices.is_empty() {
+                rp.set_pipeline(fg_pipeline);
+                rp.set_bind_group(0, bind_group, &[]);
+                rp.set_vertex_buffer(0, fg_vb.slice(..));
+                rp.set_index_buffer(fg_ib.slice(..), wgpu::IndexFormat::Uint32);
+                rp.draw_indexed(0..fg_indices.len() as u32, 0, 0..1);
+            }
+
+            // Beam/Underline cursor — rendered AFTER FG so lines show on top
+            if !self.cursor_indices.is_empty() {
+                let is_line_style = matches!(self.processor.cursor.style,
+                    vte_core::state::CursorStyle::Underline
+                    | vte_core::state::CursorStyle::BlinkingUnderline
+                    | vte_core::state::CursorStyle::Beam
+                    | vte_core::state::CursorStyle::BlinkingBeam);
+                if is_line_style {
+                    if let (Some(ref cvb), Some(ref cib)) = (&self.cursor_vb, &self.cursor_ib) {
+                        rp.set_pipeline(bg_pipeline);
+                        rp.set_bind_group(0, bind_group, &[]);
+                        rp.set_vertex_buffer(0, cvb.slice(..));
+                        rp.set_index_buffer(cib.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.draw_indexed(0..self.cursor_indices.len() as u32, 0, 0..1);
+                    }
+                }
+            }
+
+            // Debug overlay — semi-transparent cell boundary grid
+            if self.debug_show_overlay {
+                if let (Some(ref dbg_vb), Some(ref dbg_ib)) = (&self.debug_vb, &self.debug_ib) {
+                    if !self.debug_grid_indices.is_empty() {
+                        rp.set_pipeline(bg_pipeline);
+                        rp.set_bind_group(0, bind_group, &[]);
+                        rp.set_vertex_buffer(0, dbg_vb.slice(..));
+                        rp.set_index_buffer(dbg_ib.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.draw_indexed(0..self.debug_grid_indices.len() as u32, 0, 0..1);
+                    }
+                }
+            }
         }
 
         queue.submit(Some(encoder.finish()));
         frame.present();
         self.needs_redraw = false;
+        self.processor.grid.damage.clear();
+        self.render_epoch += 1;
     }
 }
 
@@ -375,18 +1606,18 @@ fn color_to_f32(color: vte_core::grid::Color, is_bg: bool) -> (f32, f32, f32) {
         }
         Color::Black => (0.0, 0.0, 0.0),
         Color::Red => (0.80, 0.16, 0.16),
-        Color::Green => (0.0, 0.59, 0.0),
+        Color::Green => (0.0, 1.0, 0.67),
         Color::Yellow => (0.80, 0.59, 0.0),
-        Color::Blue => (0.16, 0.32, 0.75),
-        Color::Magenta => (0.64, 0.16, 0.64),
-        Color::Cyan => (0.0, 0.59, 0.59),
+        Color::Blue => (0.29, 0.62, 1.0),
+        Color::Magenta => (1.0, 0.42, 0.62),
+        Color::Cyan => (0.0, 0.80, 0.80),
         Color::White => (0.83, 0.83, 0.83),
         Color::BrightBlack => (0.33, 0.33, 0.33),
         Color::BrightRed => (1.0, 0.33, 0.33),
-        Color::BrightGreen => (0.33, 1.0, 0.33),
+        Color::BrightGreen => (0.33, 1.0, 0.80),
         Color::BrightYellow => (1.0, 1.0, 0.33),
-        Color::BrightBlue => (0.33, 0.33, 1.0),
-        Color::BrightMagenta => (1.0, 0.33, 1.0),
+        Color::BrightBlue => (0.50, 0.75, 1.0),
+        Color::BrightMagenta => (1.0, 0.50, 0.75),
         Color::BrightCyan => (0.33, 1.0, 1.0),
         Color::BrightWhite => (1.0, 1.0, 1.0),
         Color::Indexed(i) => {
@@ -394,6 +1625,9 @@ fn color_to_f32(color: vte_core::grid::Color, is_bg: bool) -> (f32, f32, f32) {
                 let standard = match i {
                     0 => Color::Black, 1 => Color::Red, 2 => Color::Green, 3 => Color::Yellow,
                     4 => Color::Blue, 5 => Color::Magenta, 6 => Color::Cyan, 7 => Color::White,
+                    8 => Color::BrightBlack, 9 => Color::BrightRed, 10 => Color::BrightGreen,
+                    11 => Color::BrightYellow, 12 => Color::BrightBlue, 13 => Color::BrightMagenta,
+                    14 => Color::BrightCyan, 15 => Color::BrightWhite,
                     _ => Color::BrightBlack,
                 };
                 color_to_f32(standard, is_bg)
@@ -427,6 +1661,10 @@ impl ApexApp {
 impl Drop for ApexApp {
     fn drop(&mut self) {
         self.destroy_pty();
+        self.raster_tx = None;
+        if let Some(handle) = self.raster_worker.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -507,19 +1745,58 @@ impl ApplicationHandler for ApexApp {
 
         let initial_vert_size = 1024 * std::mem::size_of::<GlyphVertex>() as u64;
         let vertex_buf = device.create_buffer(&BufferDescriptor {
-            label: Some("Terminal Verts"),
+            label: Some("Terminal BG Verts"),
             size: initial_vert_size,
             usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let index_buf = device.create_buffer(&BufferDescriptor {
-            label: Some("Terminal Idx"),
+            label: Some("Terminal BG Idx"),
+            size: 1024 * 6 * 2,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fg_vertex_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Terminal FG Verts"),
+            size: initial_vert_size,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fg_index_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Terminal FG Idx"),
             size: 1024 * 6 * 2,
             usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let glyph_atlas = match GlyphAtlas::new(&device, &queue) {
+        let dec_vb = device.create_buffer(&BufferDescriptor {
+            label: Some("Terminal Decoration Verts"),
+            size: initial_vert_size,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dec_ib = device.create_buffer(&BufferDescriptor {
+            label: Some("Terminal Decoration Idx"),
+            size: 1024 * 6 * 2,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Initialize FontManager, then atlas and shaper from it
+        let font_manager = match FontManager::new(CELL_SIZE) {
+            Ok(fm) => fm,
+            Err(e) => {
+                log::error!("Failed to initialize font system: {e}");
+                return;
+            }
+        };
+        let primary_id = font_manager.primary_font_id();
+        let primary_font = font_manager.font(primary_id).unwrap();
+        let primary_data = font_manager.font_data(primary_id).unwrap().clone();
+
+        let glyph_atlas = match GlyphAtlas::new_with_font(
+            &device, &queue, primary_font.clone(), primary_data, self.atlas_dump.as_deref(),
+        ) {
             Ok(a) => a,
             Err(e) => {
                 log::error!("Failed to create glyph atlas: {e}");
@@ -527,25 +1804,46 @@ impl ApplicationHandler for ApexApp {
             }
         };
 
-        let (pipeline, bind_group, sampler) = Self::build_pipeline(&device, &config, &glyph_atlas.texture);
+        self.primary_ascent = font_manager.primary_ascent();
+        self.primary_underline_pos = font_manager.primary_underline_position();
+        self.primary_underline_thickness = font_manager.primary_underline_thickness().max(1.0);
+        self.primary_strikethrough_pos = font_manager.primary_strikethrough_position();
+        self.primary_strikethrough_thickness = font_manager.primary_strikethrough_thickness().max(1.0);
+        self.shaper = Some(Shaper::new(CELL_SIZE));
+        self.font_manager = Some(font_manager);
+
+        let (pipeline, fg_pipeline, bind_group, sampler) = Self::build_pipelines(&device, &config, &glyph_atlas.texture);
 
         let win_w = config.width;
         let win_h = config.height;
         self.scale_factor = window.scale_factor();
-        self.cell_w = glyph_atlas.cell_width * self.scale_factor as f32;
-        self.cell_h = glyph_atlas.cell_height * self.scale_factor as f32;
+        self.cell_w = glyph_atlas.cell_width;
+        self.cell_h = glyph_atlas.cell_height;
         self.window = Some(window);
         self.surface = Some(surface);
         self.device = Some(device);
         self.queue = Some(queue);
-        self.config = Some(config);
+        self.surface_config = Some(config);
         self.pipeline = Some(pipeline);
+        self.fg_pipeline = Some(fg_pipeline);
         self.bind_group = Some(bind_group);
         self.sampler = Some(sampler);
         self.vertex_buf = Some(vertex_buf);
         self.index_buf = Some(index_buf);
+        self.fg_vertex_buf = Some(fg_vertex_buf);
+        self.fg_index_buf = Some(fg_index_buf);
+        self.dec_vb = Some(dec_vb);
+        self.dec_ib = Some(dec_ib);
         self.glyph_atlas = Some(glyph_atlas);
         self.needs_redraw = true;
+
+        // Spawn raster worker
+        let (raster_tx, raster_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = spawn_raster_worker(raster_rx, result_tx);
+        self.raster_tx = Some(raster_tx);
+        self.raster_result_rx = Some(result_rx);
+        self.raster_worker = Some(worker);
 
         let cw = self.cell_w;
         let ch = self.cell_h;
@@ -570,7 +1868,10 @@ impl ApplicationHandler for ApexApp {
                 unsafe {
                     let flags = libc::fcntl(pty.master_fd, libc::F_GETFL, 0);
                     if flags >= 0 {
-                        libc::fcntl(pty.master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                        let ret = libc::fcntl(pty.master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                        if ret < 0 {
+                            log::error!("Failed to set PTY master_fd to O_NONBLOCK: {}", std::io::Error::last_os_error());
+                        }
                     }
                 }
 
@@ -618,8 +1919,9 @@ impl ApplicationHandler for ApexApp {
                                         Err(_) => break None,
                                     }
                                 };
-                                if let Some(n) = read_result {
-                                    if n > 0 {
+                                match read_result {
+                                    Some(0) | None => break Ok(()),
+                                    Some(n) => {
                                         let _ = output_tx.send(buf[..n].to_vec()).await;
                                     }
                                 }
@@ -656,6 +1958,23 @@ impl ApplicationHandler for ApexApp {
                 self.pty_reader = Some(pty_reader);
 
                 log::info!("PTY started: {}x{}", cols, rows);
+
+                const BANNER: &str = "\
+\x1b[38;2;0;255;170m\
+   #####   ######  ####### ##   ##\n\
+   ##  ##  ##   ## ##      ## ##\n\
+   #####   ######  #####    ###\n\
+   ##  ##  ##      ##      ## ##\n\
+   ##  ##  ##      ####### ##   ##\n\
+\x1b[0m\n\
+\x1b[38;2;0;255;170m       GPU-Accelerated Offensive Terminal\x1b[0m  \x1b[38;2;74;158;255mv0.1.0\x1b[0m\n\
+\n\
+\x1b[38;2;0;255;170m   C2\x1b[0m  \x1b[38;2;74;158;255m- Sliver | Havoc | Mythic | Empire\x1b[0m\n\
+\x1b[38;2;0;255;170m   AI\x1b[0m  \x1b[38;2;74;158;255m- Ollama | Llama.cpp\x1b[0m\n\
+\x1b[38;2;0;255;170m   MUX\x1b[0m \x1b[38;2;74;158;255m- Apex Native Multiplexer\x1b[0m\n\
+\n";
+                self.processor.advance(BANNER.as_bytes());
+                self.needs_redraw = true;
             }
             Err(e) => {
                 log::error!("Failed to start PTY: {e}");
@@ -686,10 +2005,10 @@ impl ApplicationHandler for ApexApp {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale_factor = scale_factor;
                 if let Some(ref atlas) = self.glyph_atlas {
-                    self.cell_w = atlas.cell_width * scale_factor as f32;
-                    self.cell_h = atlas.cell_height * scale_factor as f32;
+                    self.cell_w = atlas.cell_width;
+                    self.cell_h = atlas.cell_height;
                 }
-                if let Some(ref config) = self.config {
+                if let Some(ref config) = self.surface_config {
                     let w = config.width.max(1);
                     let h = config.height.max(1);
                     if self.cell_w > 0.0 && self.cell_h > 0.0 {
@@ -707,7 +2026,7 @@ impl ApplicationHandler for ApexApp {
                 let w = size.width.max(1);
                 let h = size.height.max(1);
                 if let (Some(ref mut config), Some(ref device), Some(ref surface)) =
-                    (&mut self.config, &self.device, &self.surface)
+                    (&mut self.surface_config, &self.device, &self.surface)
                 {
                     config.width = w;
                     config.height = h;
@@ -761,6 +2080,45 @@ impl ApplicationHandler for ApexApp {
                 self.needs_redraw = true;
             }
         }
+
+        // Process completed async rasterizations
+        if let Some(ref mut rx) = self.raster_result_rx {
+            while let Ok(result) = rx.try_recv() {
+                let key = result.key.clone();
+                if let Some(ref mut atlas) = self.glyph_atlas {
+                    if let Some(upload) = atlas.stage_rasterized(result) {
+                        self.pending_uploads.push(upload);
+                        self.needs_redraw = true;
+                        self.processor.grid.damage.mark_all();
+                    }
+                    self.pending_raster.remove(&key);
+                }
+            }
+        }
+
+        // Cursor blink — independent from text invalidation
+        let is_blinking = match self.processor.cursor.style {
+            vte_core::state::CursorStyle::BlinkingBlock
+            | vte_core::state::CursorStyle::BlinkingUnderline
+            | vte_core::state::CursorStyle::BlinkingBeam => true,
+            _ => self.processor.mode.contains(vte_core::state::TerminalMode::CURSOR_BLINK),
+        };
+        if is_blinking {
+            let dt = self.cursor_blink_accum + std::time::Duration::from_millis(16);
+            self.cursor_blink_accum = if dt >= std::time::Duration::from_millis(500) {
+                self.cursor_blink_visible = !self.cursor_blink_visible;
+                std::time::Duration::ZERO
+            } else {
+                dt
+            };
+            // Request redraw for cursor overlay only (no text invalidation)
+            if let Some(ref window) = self.window {
+                window.request_redraw();
+            }
+        } else {
+            self.cursor_blink_visible = true;
+        }
+
         if self.needs_redraw {
             if let Some(ref window) = self.window {
                 window.request_redraw();
@@ -769,16 +2127,21 @@ impl ApplicationHandler for ApexApp {
     }
 }
 
-pub struct WgpuRenderer;
+pub struct WgpuRenderer {
+    config: ApexConfig,
+    atlas_dump: Option<PathBuf>,
+}
 
 impl WgpuRenderer {
-    pub async fn new() -> Result<Self> {
-        Ok(WgpuRenderer)
+    pub async fn new(config: ApexConfig, atlas_dump: Option<PathBuf>) -> Result<Self> {
+        Ok(WgpuRenderer { config, atlas_dump })
     }
 
     pub async fn run(&mut self) -> Result<()> {
         let event_loop = EventLoop::new()?;
-        let mut app = ApexApp::new();
+        let config = std::mem::take(&mut self.config);
+        let atlas_dump = self.atlas_dump.take();
+        let mut app = ApexApp::new(config, atlas_dump);
         event_loop.run_app(&mut app)?;
         Ok(())
     }

@@ -1,4 +1,5 @@
 use std::os::fd::RawFd;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Child, Stdio};
 use std::os::fd::FromRawFd;
 
@@ -45,13 +46,25 @@ impl PtyInstance {
             let stdout = Stdio::from_raw_fd(stdout_fd);
             let stderr = Stdio::from_raw_fd(stderr_fd);
 
-            let child = Command::new("/usr/bin/env")
-                .arg("SHELL=/bin/bash")
-                .arg("TERM=xterm-256color")
-                .stdin(stdin)
-                .stdout(stdout)
-                .stderr(stderr)
-                .spawn();
+            let child = {
+                let mut cmd = Command::new("/bin/bash");
+                cmd.env("TERM", "xterm-256color")
+                    .stdin(stdin)
+                    .stdout(stdout)
+                    .stderr(stderr);
+                unsafe {
+                    cmd.pre_exec(|| {
+                        if libc::setsid() < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                cmd.spawn()
+            };
 
             match child {
                 Ok(c) => {

@@ -1,5 +1,8 @@
+use std::path::PathBuf;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+
+mod dumb;
 
 #[derive(Parser)]
 #[command(
@@ -24,6 +27,12 @@ struct Cli {
 
     #[arg(long, help = "Run in client (GUI) mode")]
     client: bool,
+
+    #[arg(long, help = "Run in dumb terminal mode (no GPU, raw PTY passthrough)")]
+    dumb: bool,
+
+    #[arg(long, help = "Save debug atlas image to PATH (PPM format)")]
+    dump_atlas: Option<String>,
 }
 
 fn setup_panic_hook() {
@@ -70,13 +79,17 @@ async fn main() -> anyhow::Result<()> {
         if cli.server { "server" } else { "client" }
     );
 
-    if cli.server {
+    if cli.dumb {
+        tracing::info!("Starting Apex Terminal in dumb mode (no GPU, raw PTY loop)");
+        dumb::run_dumb_terminal().await?;
+    } else if cli.server {
         tracing::info!("Starting Apex Terminal server (background multiplexer)");
         apex_server::run_server().await?;
     } else {
         tracing::info!("Starting Apex Terminal client (GUI frontend)");
-        apex_config::load_config(cli.config.as_deref())?;
-        apex_renderer::run_event_loop().await?;
+        let config = apex_config::load_config(cli.config.as_deref())?;
+        let atlas_dump = cli.dump_atlas.map(PathBuf::from);
+        apex_renderer::run_event_loop(config, atlas_dump).await?;
     }
 
     Ok(())

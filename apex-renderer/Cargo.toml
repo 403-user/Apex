@@ -14,6 +14,14 @@ anyhow = "1"
 pollster = "0.4"
 libc = "0.2"
 ab_glyph = "0.2"
+arrayvec = "0.7"
+rustybuzz = "0.18"
+ttf-parser = "0.24"
+unicode-segmentation = "1"
+unicode-script = "0.5"
+unicode-bidi = "0.3"
+bitflags = "2"
 vte-core = { path = "../vte-core" }
 apex-pty = { path = "../apex-pty" }
 tokio = { version = "1", features = ["full"] }
+apex-config = { path = "../apex-config" }

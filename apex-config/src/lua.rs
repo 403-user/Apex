@@ -6,8 +6,7 @@ impl LuaEngine {
     }
 
     pub fn load_config(&self, path: &str) -> anyhow::Result<()> {
-        tracing::warn!("Lua config engine not available - mlua feature not enabled");
-        Ok(())
+        Err(anyhow::anyhow!("Lua config engine not available - mlua feature not enabled (path: {path})"))
     }
 
     pub fn eval_string(&self, _code: &str) -> anyhow::Result<String> {

@@ -52,17 +52,15 @@ impl PtyInstance {
                     .stdin(stdin)
                     .stdout(stdout)
                     .stderr(stderr);
-                unsafe {
-                    cmd.pre_exec(|| {
-                        if libc::setsid() < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        Ok(())
-                    });
-                }
+                cmd.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
                 cmd.spawn()
             };
 

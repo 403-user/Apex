@@ -6,7 +6,6 @@ description = "GPU-accelerated terminal renderer using wgpu/WebGPU"
 
 [dependencies]
 wgpu = "22"
-wgpu-core = "22"
 winit = "0.30"
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
@@ -16,7 +15,6 @@ libc = "0.2"
 ab_glyph = "0.2"
 arrayvec = "0.7"
 rustybuzz = "0.18"
-ttf-parser = "0.24"
 unicode-segmentation = "1"
 unicode-script = "0.5"
 unicode-bidi = "0.3"

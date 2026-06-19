@@ -309,9 +309,6 @@ impl ShelfAllocator {
         Some((x, y))
     }
 
-    pub fn reset(&mut self) {
-        self.shelves.clear();
-    }
 }
 
 fn load_font() -> anyhow::Result<(FontArc, Arc<Vec<u8>>)> {
@@ -365,7 +362,6 @@ pub struct GlyphAtlas {
     pub width: u32,
     pub height: u32,
     pub font: Option<FontArc>,
-    pub font_data: Option<Arc<Vec<u8>>>,
     pub cell_width: f32,
     pub cell_height: f32,
     glyph_map: HashMap<GlyphKey, AtlasGlyph>,
@@ -376,13 +372,9 @@ pub struct GlyphAtlas {
 }
 
 impl GlyphAtlas {
-    pub fn new(device: &Device, queue: &Queue) -> anyhow::Result<Self> {
-        Self::new_with_dump(device, queue, None)
-    }
-
     pub fn new_with_font(
         device: &Device, queue: &Queue,
-        font: FontArc, font_data: Arc<Vec<u8>>,
+        font: FontArc,
         atlas_dump_path: Option<&Path>,
     ) -> anyhow::Result<Self> {
         let scale = font.pt_to_px_scale(CELL_SIZE).unwrap_or(PxScale::from(CELL_SIZE));
@@ -413,7 +405,6 @@ impl GlyphAtlas {
             width: ATLAS_SIZE,
             height: ATLAS_SIZE,
             font: Some(font),
-            font_data: Some(font_data),
             cell_width: advance.ceil().max(8.0),
             cell_height: CELL_HEIGHT,
             glyph_map: HashMap::new(),
@@ -465,83 +456,8 @@ impl GlyphAtlas {
 
     pub fn new_with_dump(device: &Device, queue: &Queue, atlas_dump_path: Option<&Path>) -> anyhow::Result<Self> {
         match load_font() {
-            Ok((f, font_data)) => {
-                let scale = f.pt_to_px_scale(CELL_SIZE).unwrap_or(PxScale::from(CELL_SIZE));
-                let scaled_font = f.as_scaled(scale);
-                let advance = scaled_font.h_advance(scaled_font.glyph_id('W'));
-
-                let mut pre_rasterize = Vec::new();
-                for ch in (32u8..=126).map(|c| c as char) {
-                    pre_rasterize.push(f.glyph_id(ch).0);
-                }
-                for ch in ['█', '▀', '▄', '░', '▒', '▓', '│', '─', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼', '●', '◆', '■'] {
-                    pre_rasterize.push(f.glyph_id(ch).0);
-                }
-
-                let mut atlas_data = vec![0u8; (ATLAS_SIZE * ATLAS_SIZE * 4) as usize];
-                let dummy = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("Glyph Atlas (placeholder)"),
-                    size: Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                });
-                let mut atlas = GlyphAtlas {
-                    texture: dummy,
-                    width: ATLAS_SIZE,
-                    height: ATLAS_SIZE,
-                    font: Some(f),
-                    font_data: Some(font_data),
-                    cell_width: advance.ceil().max(8.0),
-                    cell_height: CELL_HEIGHT,
-                    glyph_map: HashMap::new(),
-                    allocator: ShelfAllocator::new(ATLAS_SIZE),
-                    size: CELL_SIZE as u16,
-                    frame: 0,
-                    max_glyphs: 512,
-                };
-
-                for gid in pre_rasterize {
-                    let key = GlyphKey::new(gid, crate::glyph_key::FontId::default(), CELL_SIZE as u16, Default::default());
-                    atlas.rasterize(&mut atlas_data, &key);
-                }
-
-                if let Some(dump_path) = atlas_dump_path {
-                    save_atlas_ppm(&atlas_data, ATLAS_SIZE, ATLAS_SIZE, dump_path);
-                }
-
-                let tex_desc = wgpu::TextureDescriptor {
-                    label: Some("Glyph Atlas"),
-                    size: Extent3d { width: ATLAS_SIZE, height: ATLAS_SIZE, depth_or_array_layers: 1 },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                };
-                atlas.texture = device.create_texture(&tex_desc);
-                let bytes_per_row = ATLAS_SIZE as u32 * 4;
-                queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: &atlas.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &atlas_data,
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(bytes_per_row),
-                        rows_per_image: Some(ATLAS_SIZE),
-                    },
-                    tex_desc.size,
-                );
-
-                Ok(atlas)
+            Ok((f, _font_data)) => {
+                Self::new_with_font(device, queue, f, atlas_dump_path)
             }
             Err(e) => {
                 log::warn!("{e} — creating empty glyph atlas (text will not render)");
@@ -560,7 +476,6 @@ impl GlyphAtlas {
                     width: 1,
                     height: 1,
                     font: None,
-                    font_data: None,
                     cell_width: 8.0,
                     cell_height: 20.0,
                     glyph_map: HashMap::new(),
@@ -662,11 +577,4 @@ impl GlyphAtlas {
         Some(g)
     }
 
-    pub fn frame_count(&self) -> u64 {
-        self.frame
-    }
-
-    pub fn glyph_count(&self) -> usize {
-        self.glyph_map.len()
-    }
 }

@@ -50,10 +50,6 @@ impl Shaper {
         Shaper { font_size }
     }
 
-    pub fn font_size(&self) -> f32 {
-        self.font_size
-    }
-
     /// Shape a run of text with a specific font. `font_id` is stamped on each
     /// output `ShapedGlyph` so the renderer can look up the correct atlas entry.
     /// `cluster_to_col` maps each byte offset in the input text to its grid column.

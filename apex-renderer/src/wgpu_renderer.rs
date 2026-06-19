@@ -19,6 +19,8 @@ use winit::{
     window::Window,
 };
 use std::collections::HashSet;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -28,11 +30,11 @@ use tokio::task::JoinHandle;
 
 use arrayvec::ArrayString;
 use crate::atlas::{flush_uploads, GlyphAtlas, GlyphVertex, PendingUpload, RasterRequest, RasterResult, spawn_raster_worker, ATLAS_SIZE, CELL_SIZE};
-use std::collections::HashMap;
 use crate::shaper::{Shaper, TextRun, TextDirection, ShapedGlyph, VisualRun};
 use crate::font_manager::FontManager;
 use unicode_script::UnicodeScript;
 use apex_config::ApexConfig;
+use vte_core::grid::CellFlags;
 use apex_pty::PtyInstance;
 use vte_core::parser::VteProcessor;
 
@@ -42,7 +44,6 @@ pub struct CachedRowMesh {
     pub bg_vertices: Vec<GlyphVertex>,
     pub fg_vertices: Vec<GlyphVertex>,
     pub dec_vertices: Vec<GlyphVertex>,
-    pub generation: u64,
 }
 
 impl CachedRowMesh {
@@ -51,7 +52,6 @@ impl CachedRowMesh {
             bg_vertices: Vec::new(),
             fg_vertices: Vec::new(),
             dec_vertices: Vec::new(),
-            generation: 0,
         }
     }
 }
@@ -73,6 +73,32 @@ impl SelectionRange {
             end_row: 0,
             end_col: 0,
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct SearchMatch {
+    pub start_row: usize,
+    pub start_col: usize,
+    pub end_row: usize,
+    pub end_col: usize,
+}
+
+pub struct SearchHighlight {
+    pub query: String,
+    pub matches: Vec<SearchMatch>,
+}
+
+impl SearchHighlight {
+    pub fn new() -> Self {
+        SearchHighlight {
+            query: String::new(),
+            matches: Vec::new(),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.query.is_empty() && !self.matches.is_empty()
     }
 }
 
@@ -101,8 +127,6 @@ struct ApexApp {
     input_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     output_rx: Option<mpsc::Receiver<Vec<u8>>>,
     pty_reader: Option<JoinHandle<()>>,
-    #[allow(dead_code)]
-    apex_config: ApexConfig,
     atlas_dump: Option<PathBuf>,
     row_cache: Vec<CachedRowMesh>,
     render_epoch: u64,
@@ -138,11 +162,20 @@ struct ApexApp {
     selection_indices: Vec<u32>,
     selection_vb: Option<wgpu::Buffer>,
     selection_ib: Option<wgpu::Buffer>,
+    search: SearchHighlight,
+    search_vertices: Vec<GlyphVertex>,
+    search_indices: Vec<u32>,
+    search_vb: Option<wgpu::Buffer>,
+    search_ib: Option<wgpu::Buffer>,
+    mouse_down_row: usize,
+    mouse_down_col: usize,
+    last_mouse_x: f64,
+    last_mouse_y: f64,
 }
 
 impl ApexApp {
-    fn new(apex_config: ApexConfig, atlas_dump: Option<PathBuf>) -> Self {
-        let scrollback = apex_config.scrollback_lines as usize;
+    fn new(scrollback_lines: u32, atlas_dump: Option<PathBuf>) -> Self {
+        let scrollback = scrollback_lines as usize;
         ApexApp {
             window: None,
             surface: None,
@@ -168,7 +201,6 @@ impl ApexApp {
             input_tx: None,
             output_rx: None,
             pty_reader: None,
-            apex_config,
             atlas_dump,
             row_cache: Vec::new(),
             render_epoch: 0,
@@ -184,7 +216,7 @@ impl ApexApp {
             primary_underline_thickness: 1.5,
             primary_strikethrough_pos: -14.0 * 0.3,
             primary_strikethrough_thickness: 1.5,
-            debug_show_overlay: true,
+            debug_show_overlay: false,
             debug_grid_vertices: Vec::new(),
             debug_grid_indices: Vec::new(),
             debug_vb: None,
@@ -204,6 +236,15 @@ impl ApexApp {
             selection_indices: Vec::new(),
             selection_vb: None,
             selection_ib: None,
+            search: SearchHighlight::new(),
+            search_vertices: Vec::new(),
+            search_indices: Vec::new(),
+            search_vb: None,
+            search_ib: None,
+            mouse_down_row: 0,
+            mouse_down_col: 0,
+            last_mouse_x: 0.0,
+            last_mouse_y: 0.0,
         }
     }
 
@@ -344,7 +385,6 @@ impl ApexApp {
 
     /// Compute a content fingerprint for a row for the shaped row cache.
     fn row_fingerprint(&self, row: usize) -> u64 {
-        use std::hash::{Hash, Hasher};
         let cols = self.processor.grid.cols;
         if row >= self.processor.grid.rows.len() {
             return 0;
@@ -393,7 +433,6 @@ impl ApexApp {
 
     /// Break a grid row into contiguous TextRuns grouped by style and script.
     fn break_row_into_runs(&self, row: usize) -> Vec<TextRun> {
-        use vte_core::grid::CellFlags;
         let cols = self.processor.grid.cols;
         if row >= self.processor.grid.rows.len() || cols == 0 {
             return Vec::new();
@@ -466,24 +505,6 @@ impl ApexApp {
             }
         }
         logical_col
-    }
-
-    /// Project a visual column back to its logical column. Inverse of
-    /// `logical_to_visual`.
-    #[allow(dead_code)]
-    fn visual_to_logical(&self, row: usize, visual_col: usize) -> usize {
-        let runs = self.break_row_into_runs(row);
-        for run in &runs {
-            if visual_col >= run.col_start && visual_col < run.col_end {
-                return match run.direction {
-                    TextDirection::Rtl => {
-                        run.col_start + (run.col_end - 1 - visual_col)
-                    }
-                    TextDirection::Ltr => visual_col,
-                };
-            }
-        }
-        visual_col
     }
 
     /// Reorder runs from logical order into visual rendering order using
@@ -573,7 +594,6 @@ impl ApexApp {
         px_to_ndc: &impl Fn(f32, f32) -> [f32; 2],
     ) -> (Vec<GlyphVertex>, Vec<GlyphVertex>, Vec<crate::glyph_key::GlyphKey>)
     {
-        use vte_core::grid::CellFlags;
         let cols = self.processor.grid.cols;
         if row >= self.processor.grid.rows.len() {
             return (Vec::new(), Vec::new(), Vec::new());
@@ -581,9 +601,12 @@ impl ApexApp {
         let mut bg = Vec::with_capacity(cols * 6);
         let mut fg = Vec::with_capacity(cols * 6);
         let mut missing = Vec::new();
+        let global_reverse = self.processor.mode.contains(vte_core::state::TerminalMode::REVERSE_VIDEO);
         for col in 0..cols {
             let cell = &self.processor.grid.rows[row].cells[col];
-            let reverse = cell.flags.contains(CellFlags::REVERSE);
+            // Skip spacer cells from wide characters
+            if cell.width == 0 { continue; }
+            let reverse = cell.flags.contains(CellFlags::REVERSE) ^ global_reverse;
             let dim = if cell.flags.contains(CellFlags::DIM) { 0.5 } else { 1.0 };
             let (fg_r, fg_g, fg_b) = color_to_f32(cell.fg_color, reverse);
             let (bg_r, bg_g, bg_b) = color_to_f32(cell.bg_color, !reverse);
@@ -657,6 +680,8 @@ impl ApexApp {
     /// Main row vertex builder — dispatches between ASCII fast path and
     /// shaped text path.
     fn build_row_vertices(&mut self, row: usize, cw: f32, ch: f32, px_to_ndc: &impl Fn(f32, f32) -> [f32; 2]) -> (Vec<GlyphVertex>, Vec<GlyphVertex>, Vec<crate::glyph_key::GlyphKey>) {
+        // Clear decoration vertices first to avoid stale data on early return
+        self.row_cache[row].dec_vertices.clear();
         if row >= self.processor.grid.rows.len() {
             return (Vec::new(), Vec::new(), Vec::new());
         }
@@ -675,11 +700,12 @@ impl ApexApp {
         let cells = &self.processor.grid.rows[row].cells;
 
         // Background quads — one per grid column (grid remains authoritative)
-        use vte_core::grid::CellFlags;
         let mut bg = Vec::with_capacity(cols * 6);
+        let global_reverse = self.processor.mode.contains(vte_core::state::TerminalMode::REVERSE_VIDEO);
         for col in 0..cols {
             let cell = &cells[col];
-            let reverse = cell.flags.contains(CellFlags::REVERSE);
+            if cell.width == 0 { continue; }
+            let reverse = cell.flags.contains(CellFlags::REVERSE) ^ global_reverse;
             let dim = if cell.flags.contains(CellFlags::DIM) { 0.5 } else { 1.0 };
             let (fg_r, fg_g, fg_b) = color_to_f32(cell.fg_color, reverse);
             let (bg_r, bg_g, bg_b) = color_to_f32(cell.bg_color, !reverse);
@@ -706,8 +732,7 @@ impl ApexApp {
         let fingerprint = self.row_fingerprint(row);
         let cache_key = (fingerprint, atlas_size);
 
-        let (shaped_glyphs, run_col_starts, run_directions, run_col_ends) = if self.shaped_row_cache.contains_key(&cache_key) {
-            let entry = self.shaped_row_cache.get_mut(&cache_key).unwrap();
+        let (shaped_glyphs, run_col_starts, run_directions, run_col_ends) = if let Some(entry) = self.shaped_row_cache.get_mut(&cache_key) {
             entry.4 = self.shaped_cache_gen;
             self.shaped_cache_gen += 1;
             (entry.0.clone(), entry.1.clone(), entry.2.clone(), entry.3.clone())
@@ -833,9 +858,11 @@ impl ApexApp {
                 continue;
             }
 
+            let global_reverse = self.processor.mode.contains(vte_core::state::TerminalMode::REVERSE_VIDEO);
+            let cell_reverse = cell.flags.contains(CellFlags::REVERSE) ^ global_reverse;
             let dim = if cell.flags.contains(CellFlags::DIM) { 0.5 } else { 1.0 };
-            let (fg_r, fg_g, fg_b) = color_to_f32(cell.fg_color, false);
-            let (bg_r, bg_g, bg_b) = color_to_f32(cell.bg_color, !cell.flags.contains(CellFlags::REVERSE));
+            let (fg_r, fg_g, fg_b) = color_to_f32(cell.fg_color, cell_reverse);
+            let (bg_r, bg_g, bg_b) = color_to_f32(cell.bg_color, !cell_reverse);
             let fg_color = [fg_r * dim, fg_g * dim, fg_b * dim, 1.0];
             let bg_color = [bg_r, bg_g, bg_b, 1.0];
 
@@ -887,7 +914,6 @@ impl ApexApp {
         }
 
         // Generate decoration overlay quads (underline/strikethrough) — common to both paths
-        use vte_core::grid::CellFlags;
         let cols = self.processor.grid.cols;
         let cells = &self.processor.grid.rows[row].cells;
         let baseline_y = row as f32 * ch + self.primary_ascent;
@@ -910,8 +936,10 @@ impl ApexApp {
             };
 
             if let Some((dec_y, dec_h)) = style {
+                let global_reverse = self.processor.mode.contains(vte_core::state::TerminalMode::REVERSE_VIDEO);
+                let cell_reverse = cell.flags.contains(CellFlags::REVERSE) ^ global_reverse;
                 let dim = if cell.flags.contains(CellFlags::DIM) { 0.5 } else { 1.0 };
-                let (r, g, b) = color_to_f32(cell.fg_color, cell.flags.contains(CellFlags::REVERSE));
+                let (r, g, b) = color_to_f32(cell.fg_color, cell_reverse);
                 let color = [r * dim, g * dim, b * dim, 1.0];
 
                 let x = col as f32 * cw;
@@ -966,7 +994,6 @@ impl ApexApp {
                 let (bg, fg, missing) = self.build_row_vertices(row, cw, ch, &px_to_ndc);
                 self.row_cache[row].bg_vertices = bg;
                 self.row_cache[row].fg_vertices = fg;
-                self.row_cache[row].generation = self.render_epoch;
                 for key in missing {
                     missing_set.insert(key);
                 }
@@ -984,10 +1011,11 @@ impl ApexApp {
             }
         }
 
-        // Concatenate all cached rows into bg, fg, and decoration lists
-        let bg_total: usize = self.row_cache.iter().map(|r| r.bg_vertices.len()).sum();
-        let fg_total: usize = self.row_cache.iter().map(|r| r.fg_vertices.len()).sum();
-        let dec_total: usize = self.row_cache.iter().map(|r| r.dec_vertices.len()).sum();
+        // Concatenate all cached rows into bg, fg, and decoration lists — single pass
+        let (bg_total, fg_total, dec_total) = self.row_cache.iter().fold(
+            (0usize, 0usize, 0usize),
+            |(b, f, d), r| (b + r.bg_vertices.len(), f + r.fg_vertices.len(), d + r.dec_vertices.len()),
+        );
         let mut bg_vertices = Vec::with_capacity(bg_total);
         let mut fg_vertices = Vec::with_capacity(fg_total);
         let mut dec_vertices = Vec::with_capacity(dec_total);
@@ -1250,6 +1278,168 @@ impl ApexApp {
         }
     }
 
+    fn screen_to_grid(&self, px: f64, py: f64) -> Option<(usize, usize)> {
+        let rows = self.processor.grid.rows.len();
+        let cols = self.processor.grid.cols;
+        let visible = self.processor.grid.rows_visible;
+        let scrollback = rows.saturating_sub(visible);
+        if self.cell_w <= 0.0 || self.cell_h <= 0.0 { return None; }
+        let col = (px as f32 / self.cell_w) as usize;
+        let vis_row = (py as f32 / self.cell_h) as usize;
+        if col >= cols || vis_row >= visible { return None; }
+        let row = scrollback + vis_row;
+        if row >= rows { return None; }
+        Some((row, col))
+    }
+
+    fn last_mouse_grid_pos(&self) -> Option<(usize, usize)> {
+        self.screen_to_grid(self.last_mouse_x, self.last_mouse_y)
+    }
+
+    #[allow(dead_code)]
+    fn search_text(&mut self, query: &str) {
+        self.search.query = query.to_string();
+        self.search.matches.clear();
+        if query.is_empty() { return; }
+
+        let rows = self.processor.grid.rows.len();
+        let cols = self.processor.grid.cols;
+        let query_lower = query.to_lowercase();
+
+        for row in 0..rows {
+            let mut col = 0;
+            while col < cols {
+                // Build the cell's visible text (respect width 0 spacer skip)
+                let cell = &self.processor.grid.rows[row].cells[col];
+                let cell_text: String = cell.content.chars().collect();
+                let cell_lower = cell_text.to_lowercase();
+
+                if cell_lower.starts_with(&query_lower[..1]) || query.is_empty() {
+                    // Try to match the full query starting here
+                    let mut match_len = 0;
+                    let mut query_idx = 0;
+                    let match_col = col;
+                    let mut matched = true;
+                    let query_chars: Vec<char> = query_lower.chars().collect();
+
+                    while query_idx < query_chars.len() && col + match_len < cols {
+                        let c = &self.processor.grid.rows[row].cells[col + match_len];
+                        let t: String = c.content.chars().collect();
+                        let t_lower = t.to_lowercase();
+                        let remaining: String = query_chars[query_idx..].iter().collect();
+
+                        if t_lower.starts_with(&remaining) {
+                            match_len += remaining.len().saturating_sub(1).max(1);
+                            query_idx = query_chars.len();
+                            break;
+                        }
+
+                        if t_lower.starts_with(&query_chars[query_idx..query_idx.saturating_add(1)].iter().collect::<String>()) {
+                            query_idx += 1;
+                            match_len += 1;
+                        } else {
+                            matched = false;
+                            break;
+                        }
+                    }
+
+                    if matched && query_idx >= query_chars.len() {
+                        self.search.matches.push(SearchMatch {
+                            start_row: row,
+                            start_col: match_col,
+                            end_row: row,
+                            end_col: match_col + match_len.saturating_sub(1),
+                        });
+                    }
+                }
+                col += 1;
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn search_next(&mut self) -> Option<&SearchMatch> {
+        if self.search.matches.is_empty() { return None; }
+        // Find the first match at or after the cursor position
+        let cursor_row = self.processor.cursor.row;
+        let cursor_col = self.processor.cursor.col;
+        for m in &self.search.matches {
+            if m.start_row > cursor_row || (m.start_row == cursor_row && m.start_col >= cursor_col) {
+                return Some(m);
+            }
+        }
+        self.search.matches.first()
+    }
+
+    #[allow(dead_code)]
+    fn search_prev(&mut self) -> Option<&SearchMatch> {
+        if self.search.matches.is_empty() { return None; }
+        let cursor_row = self.processor.cursor.row;
+        let cursor_col = self.processor.cursor.col;
+        for m in self.search.matches.iter().rev() {
+            if m.end_row < cursor_row || (m.end_row == cursor_row && m.end_col <= cursor_col) {
+                return Some(m);
+            }
+        }
+        self.search.matches.last()
+    }
+
+    fn build_search_overlay(&mut self, cw: f32, ch: f32) {
+        self.search_vertices.clear();
+        self.search_indices.clear();
+
+        if !self.search.is_active() { return; }
+
+        let rows = self.processor.grid.rows.len();
+        let visible = self.processor.grid.rows_visible;
+        let cols = self.processor.grid.cols;
+        let scrollback = rows.saturating_sub(visible);
+
+        let (win_w, win_h) = self.surface_config
+            .as_ref()
+            .map(|c| (c.width as f32, c.height as f32))
+            .unwrap_or((960.0, 540.0));
+        let sx = 2.0 / win_w;
+        let sy = -2.0 / win_h;
+        let ox = -1.0;
+        let oy = 1.0;
+        let px_to_ndc = |px: f32, py: f32| -> [f32; 2] {
+            [px * sx + ox, py * sy + oy]
+        };
+
+        // Search highlight color — semi-transparent yellow
+        let search_color = [0.8, 0.6, 0.0, 0.4];
+
+        for m in &self.search.matches {
+            for row in m.start_row..=m.end_row {
+                let vis_row = row.saturating_sub(scrollback);
+                if vis_row >= visible { continue; }
+
+                let r_start_c = if row == m.start_row { m.start_col } else { 0 };
+                let r_end_c = if row == m.end_row { m.end_col } else { cols.saturating_sub(1) };
+
+                for logical_col in r_start_c..=r_end_c {
+                    let col = self.logical_to_visual(row, logical_col);
+                    let x = col as f32 * cw;
+                    let y = vis_row as f32 * ch;
+                    let tl = px_to_ndc(x, y);
+                    let tr = px_to_ndc(x + cw, y);
+                    let bl = px_to_ndc(x, y + ch);
+                    let br = px_to_ndc(x + cw, y + ch);
+                    self.search_vertices.extend_from_slice(&[
+                        GlyphVertex { position: tl, uv: [0.0; 2], fg_color: search_color, bg_color: [0.0; 4] },
+                        GlyphVertex { position: tr, uv: [0.0; 2], fg_color: search_color, bg_color: [0.0; 4] },
+                        GlyphVertex { position: bl, uv: [0.0; 2], fg_color: search_color, bg_color: [0.0; 4] },
+                        GlyphVertex { position: br, uv: [0.0; 2], fg_color: search_color, bg_color: [0.0; 4] },
+                        GlyphVertex { position: tr, uv: [0.0; 2], fg_color: search_color, bg_color: [0.0; 4] },
+                        GlyphVertex { position: bl, uv: [0.0; 2], fg_color: search_color, bg_color: [0.0; 4] },
+                    ]);
+                    self.search_indices.extend(0..6);
+                }
+            }
+        }
+    }
+
     fn render(&mut self) {
         // Flush staged uploads before building vertex data
         if !self.pending_uploads.is_empty() {
@@ -1282,6 +1472,7 @@ impl ApexApp {
         let (bg_vertices, fg_vertices, bg_indices, fg_indices, dec_vertices, dec_indices) = self.build_vertex_data();
         self.build_cursor_overlay(self.cell_w, self.cell_h);
         self.build_selection_overlay(self.cell_w, self.cell_h);
+        self.build_search_overlay(self.cell_w, self.cell_h);
         if bg_vertices.is_empty() && fg_vertices.is_empty() && dec_vertices.is_empty()
             && self.cursor_vertices.is_empty() && self.selection_indices.is_empty() {
             log::warn!("No vertices to render");
@@ -1440,6 +1631,32 @@ impl ApexApp {
             }
         }
 
+        // Upload search highlight overlay vertex data
+        if !self.search_indices.is_empty() {
+            let sh_vert_bytes = bytemuck::cast_slice(&self.search_vertices);
+            let sh_idx_bytes = bytemuck::cast_slice(&self.search_indices);
+            if self.search_vb.as_ref().map_or(true, |vb| vb.size() < sh_vert_bytes.len() as u64) {
+                self.search_vb = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("Search Verts"),
+                    size: sh_vert_bytes.len().max(64) as u64,
+                    usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            if self.search_ib.as_ref().map_or(true, |ib| ib.size() < sh_idx_bytes.len() as u64) {
+                self.search_ib = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("Search Idx"),
+                    size: sh_idx_bytes.len().max(64) as u64,
+                    usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            if let (Some(ref svb), Some(ref sib)) = (&self.search_vb, &self.search_ib) {
+                queue.write_buffer(svb, 0, sh_vert_bytes);
+                queue.write_buffer(sib, 0, sh_idx_bytes);
+            }
+        }
+
         // Upload debug grid overlay
         if self.debug_show_overlay && !self.debug_grid_indices.is_empty() {
             let dbg_vert_bytes = bytemuck::cast_slice(&self.debug_grid_vertices);
@@ -1530,6 +1747,17 @@ impl ApexApp {
                     rp.set_vertex_buffer(0, svb.slice(..));
                     rp.set_index_buffer(sib.slice(..), wgpu::IndexFormat::Uint32);
                     rp.draw_indexed(0..self.selection_indices.len() as u32, 0, 0..1);
+                }
+            }
+
+            // Search highlight overlay — rendered after selection, before block cursor
+            if !self.search_indices.is_empty() {
+                if let (Some(ref svb), Some(ref sib)) = (&self.search_vb, &self.search_ib) {
+                    rp.set_pipeline(bg_pipeline);
+                    rp.set_bind_group(0, bind_group, &[]);
+                    rp.set_vertex_buffer(0, svb.slice(..));
+                    rp.set_index_buffer(sib.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..self.search_indices.len() as u32, 0, 0..1);
                 }
             }
 
@@ -1792,10 +2020,9 @@ impl ApplicationHandler for ApexApp {
         };
         let primary_id = font_manager.primary_font_id();
         let primary_font = font_manager.font(primary_id).unwrap();
-        let primary_data = font_manager.font_data(primary_id).unwrap().clone();
 
         let glyph_atlas = match GlyphAtlas::new_with_font(
-            &device, &queue, primary_font.clone(), primary_data, self.atlas_dump.as_deref(),
+            &device, &queue, primary_font.clone(), self.atlas_dump.as_deref(),
         ) {
             Ok(a) => a,
             Err(e) => {
@@ -1865,13 +2092,11 @@ impl ApplicationHandler for ApexApp {
         match PtyInstance::new(pty_rows, pty_cols) {
             Ok(pty) => {
                 // Set master_fd non-blocking for async reads
-                unsafe {
-                    let flags = libc::fcntl(pty.master_fd, libc::F_GETFL, 0);
-                    if flags >= 0 {
-                        let ret = libc::fcntl(pty.master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                        if ret < 0 {
-                            log::error!("Failed to set PTY master_fd to O_NONBLOCK: {}", std::io::Error::last_os_error());
-                        }
+                let flags = unsafe { libc::fcntl(pty.master_fd, libc::F_GETFL, 0) };
+                if flags >= 0 {
+                    let ret = unsafe { libc::fcntl(pty.master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+                    if ret < 0 {
+                        log::error!("Failed to set PTY master_fd to O_NONBLOCK: {}", std::io::Error::last_os_error());
                     }
                 }
 
@@ -2045,6 +2270,39 @@ impl ApplicationHandler for ApexApp {
             WindowEvent::RedrawRequested => {
                 self.render();
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.last_mouse_x = position.x;
+                self.last_mouse_y = position.y;
+                if self.selection.active {
+                    if let Some((row, col)) = self.screen_to_grid(position.x, position.y) {
+                        self.selection.end_row = row;
+                        self.selection.end_col = col;
+                        self.needs_redraw = true;
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } if button == winit::event::MouseButton::Left => {
+                // Need cursor position — winit provides it via CursorMoved events
+                // We store the mouse_down position via CursorMoved tracking
+                match state {
+                    winit::event::ElementState::Pressed => {
+                        self.selection.active = true;
+                        if let Some((row, col)) = self.last_mouse_grid_pos() {
+                            self.selection.start_row = row;
+                            self.selection.start_col = col;
+                            self.selection.end_row = row;
+                            self.selection.end_col = col;
+                            self.mouse_down_row = row;
+                            self.mouse_down_col = col;
+                        }
+                        self.needs_redraw = true;
+                    }
+                    winit::event::ElementState::Released => {
+                        // Selection complete — keep end position
+                        self.needs_redraw = true;
+                    }
+                }
+            }
             WindowEvent::KeyboardInput {
                 event: ke,
                 ..
@@ -2128,20 +2386,19 @@ impl ApplicationHandler for ApexApp {
 }
 
 pub struct WgpuRenderer {
-    config: ApexConfig,
+    scrollback_lines: u32,
     atlas_dump: Option<PathBuf>,
 }
 
 impl WgpuRenderer {
     pub async fn new(config: ApexConfig, atlas_dump: Option<PathBuf>) -> Result<Self> {
-        Ok(WgpuRenderer { config, atlas_dump })
+        Ok(WgpuRenderer { scrollback_lines: config.scrollback_lines, atlas_dump })
     }
 
     pub async fn run(&mut self) -> Result<()> {
         let event_loop = EventLoop::new()?;
-        let config = std::mem::take(&mut self.config);
         let atlas_dump = self.atlas_dump.take();
-        let mut app = ApexApp::new(config, atlas_dump);
+        let mut app = ApexApp::new(self.scrollback_lines, atlas_dump);
         event_loop.run_app(&mut app)?;
         Ok(())
     }

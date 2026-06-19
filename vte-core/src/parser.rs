@@ -57,8 +57,15 @@ impl VteProcessor {
             return;
         }
 
-        // w == 1 or 2: overwrite cell
-        let cell = &mut self.grid.rows[row].cells[col];
+        // w == 1 or 2: overwrite cell (insert mode pushes existing chars right)
+        let cells = &mut self.grid.rows[row].cells;
+        if self.mode.contains(TerminalMode::INSERT_MODE) && col + 1 < self.grid.cols {
+            // Shift existing characters right by one position
+            for c in (col + 1..self.grid.cols).rev() {
+                cells[c] = cells[c - 1].clone();
+            }
+        }
+        let cell = &mut cells[col];
         let mut s = ArrayString::new();
         s.push(c);
         cell.content = s;
@@ -181,13 +188,31 @@ impl VteProcessor {
         }
     }
 
-    fn clear_line(&mut self) {
-        if self.cursor.row < self.grid.rows.len() {
-            for cell in self.grid.rows[self.cursor.row].cells.iter_mut() {
-                *cell = Cell::default();
+    fn clear_line(&mut self, mode: u16) {
+        let row = self.cursor.row;
+        if row >= self.grid.rows.len() { return; }
+        let cells = &mut self.grid.rows[row].cells;
+        match mode {
+            0 => { // cursor to end of line
+                let col = self.cursor.col.min(cells.len().saturating_sub(1));
+                for c in cells.iter_mut().skip(col) {
+                    *c = Cell::default();
+                }
             }
-            self.grid.damage.mark_row(self.cursor.row);
+            1 => { // start of line to cursor
+                let col = self.cursor.col.min(cells.len().saturating_sub(1));
+                for c in cells.iter_mut().take(col.saturating_add(1)) {
+                    *c = Cell::default();
+                }
+            }
+            2 => { // entire line
+                for c in cells.iter_mut() {
+                    *c = Cell::default();
+                }
+            }
+            _ => {}
         }
+        self.grid.damage.mark_row(row);
     }
 
     fn delete_characters(&mut self, count: usize) {
@@ -384,7 +409,13 @@ impl VteProcessor {
     }
 
     fn set_cursor_row(&mut self, row: usize) {
-        self.cursor.row = row.min(self.grid.rows.len().saturating_sub(1));
+        if self.mode.contains(TerminalMode::ORIGIN) {
+            let scroll_top = self.grid.scroll_top;
+            let max_row = self.grid.scroll_bottom.min(self.grid.rows.len().saturating_sub(1));
+            self.cursor.row = (scroll_top + row).min(max_row);
+        } else {
+            self.cursor.row = row.min(self.grid.rows.len().saturating_sub(1));
+        }
     }
 
     fn set_cursor_col(&mut self, col: usize) {
@@ -533,10 +564,7 @@ impl Perform for VteProcessor {
                 self.set_cursor_col(col);
             }
             'J' => self.clear_screen(default(0, 0)),
-            'K' => match default(0, 0) {
-                0 | 1 | 2 => self.clear_line(),
-                _ => {}
-            },
+            'K' => self.clear_line(default(0, 0)),
             '@' => self.insert_characters(default(0, 1) as usize),
             'G' => self.cursor_horizontal_absolute(default(0, 1).saturating_sub(1) as usize),
             'L' => self.insert_lines(default(0, 1) as usize),

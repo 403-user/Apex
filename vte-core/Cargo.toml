@@ -12,3 +12,4 @@ log = "0.4"
 serde = { version = "1", features = ["derive"] }
 bitflags = "2"
 arrayvec = "0.7"
+base64 = "0.22"

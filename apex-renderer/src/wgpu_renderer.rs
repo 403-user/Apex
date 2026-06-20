@@ -135,6 +135,19 @@ struct ApexApp {
     fg_pipeline: Option<RenderPipeline>,
     bind_group: Option<wgpu::BindGroup>,
     sampler: Option<wgpu::Sampler>,
+    compute_pipeline: Option<wgpu::ComputePipeline>,
+    compute_bind_group: Option<wgpu::BindGroup>,
+    glyph_input_buf: Option<wgpu::Buffer>,
+    glyph_output_buf: Option<wgpu::Buffer>,
+    glyph_uniform_buf: Option<wgpu::Buffer>,
+    graphics_overlay_texture: Option<wgpu::Texture>,
+    graphics_overlay_view: Option<wgpu::TextureView>,
+    graphics_overlay_bind_group: Option<wgpu::BindGroup>,
+    overlay_pipeline: Option<wgpu::RenderPipeline>,
+    overlay_bgl: Option<wgpu::BindGroupLayout>,
+    overlay_sampler: Option<wgpu::Sampler>,
+    overlay_quad_vb: Option<wgpu::Buffer>,
+    overlay_quad_ib: Option<wgpu::Buffer>,
     vertex_buf: Option<wgpu::Buffer>,
     index_buf: Option<wgpu::Buffer>,
     fg_vertex_buf: Option<wgpu::Buffer>,
@@ -212,6 +225,19 @@ impl ApexApp {
             fg_pipeline: None,
             bind_group: None,
             sampler: None,
+            compute_pipeline: None,
+            compute_bind_group: None,
+            glyph_input_buf: None,
+            glyph_output_buf: None,
+            glyph_uniform_buf: None,
+            graphics_overlay_texture: None,
+            graphics_overlay_view: None,
+            graphics_overlay_bind_group: None,
+            overlay_pipeline: None,
+            overlay_bgl: None,
+            overlay_sampler: None,
+            overlay_quad_vb: None,
+            overlay_quad_ib: None,
             vertex_buf: None,
             index_buf: None,
             fg_vertex_buf: None,
@@ -277,7 +303,7 @@ impl ApexApp {
         }
     }
 
-    fn build_pipelines(device: &Device, config: &SurfaceConfiguration, texture: &wgpu::Texture) -> (RenderPipeline, RenderPipeline, wgpu::BindGroup, wgpu::Sampler) {
+    fn build_pipelines(device: &Device, config: &SurfaceConfiguration, texture: &wgpu::Texture) -> (RenderPipeline, RenderPipeline, wgpu::BindGroup, wgpu::Sampler, wgpu::BindGroupLayout) {
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("Terminal Shader"),
             source: ShaderSource::Wgsl(include_str!("shaders/terminal.wgsl").into()),
@@ -395,7 +421,146 @@ impl ApexApp {
             cache: None,
         });
 
-        (bg_pipeline, fg_pipeline, bind_group, sampler)
+        (bg_pipeline, fg_pipeline, bind_group, sampler, bind_group_layout)
+    }
+
+    fn build_overlay_pipeline(device: &Device, config: &SurfaceConfiguration, atlas_bgl: &wgpu::BindGroupLayout) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::Sampler) {
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Terminal Shader"),
+            source: ShaderSource::Wgsl(include_str!("shaders/terminal.wgsl").into()),
+        });
+        let overlay_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("Overlay Sampler"),
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            address_mode_w: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: FilterMode::Nearest,
+            ..Default::default()
+        });
+        let overlay_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Overlay Texture Layout"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Overlay Pipeline Layout"),
+            bind_group_layouts: &[atlas_bgl, &overlay_bgl],
+            push_constant_ranges: &[],
+        });
+        let vtx_layout = VertexBufferLayout {
+            array_stride: std::mem::size_of::<GlyphVertex>() as u64,
+            step_mode: VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![
+                0 => Float32x2,
+                1 => Float32x2,
+                2 => Float32x4,
+                3 => Float32x4,
+            ],
+        };
+        let overlay_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Overlay Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                compilation_options: Default::default(),
+                buffers: &[vtx_layout],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: "fs_overlay",
+                compilation_options: Default::default(),
+                targets: &[Some(ColorTargetState {
+                    format: config.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        (overlay_pipeline, overlay_bgl, overlay_sampler)
+    }
+
+    fn build_compute_pipeline(device: &Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+        let compute_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Compute Shader"),
+            source: ShaderSource::Wgsl(include_str!("shaders/compute.wgsl").into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Compute Bind Group Layout"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Compute Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Glyph Compute Pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &compute_shader,
+            entry_point: "cs_main",
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        (pipeline, bind_group_layout)
     }
 
     fn row_is_ascii_simple(&self, row: usize) -> bool {
@@ -1513,6 +1678,92 @@ impl ApexApp {
             return;
         }
 
+        // Update graphics overlay (Sixel/Kitty) if new data arrives
+        if let Some(graphics_image) = self.processor.graphics_image.take() {
+            if let (Some(device), Some(queue)) = (self.device.as_ref(), self.queue.as_ref()) {
+                let width = graphics_image.width.max(1);
+                let height = graphics_image.height.max(1);
+
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Graphics Overlay Texture"),
+                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+                let data = if graphics_image.data.len() >= (width * height * 4) as usize {
+                    &graphics_image.data
+                } else {
+                    let mut padded = vec![0u8; (width * height * 4) as usize];
+                    padded[..graphics_image.data.len()].copy_from_slice(&graphics_image.data);
+                    queue.write_texture(
+                        wgpu::ImageCopyTexture { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                        &padded,
+                        wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+                        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    );
+                    self.graphics_overlay_texture = Some(texture);
+                    self.graphics_overlay_view = Some(view);
+                    return;
+                };
+                queue.write_texture(
+                    wgpu::ImageCopyTexture { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                    data,
+                    wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+                    wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                );
+
+                if let (Some(overlay_bgl), Some(overlay_sampler)) = (self.overlay_bgl.as_ref(), self.overlay_sampler.as_ref()) {
+                    let bind_group = device.create_bind_group(&BindGroupDescriptor {
+                        label: Some("Graphics Overlay Bind Group"),
+                        layout: overlay_bgl,
+                        entries: &[
+                            BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                            BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(overlay_sampler) },
+                        ],
+                    });
+                    self.graphics_overlay_bind_group = Some(bind_group);
+                }
+
+                let overlay_vertices = vec![
+                    GlyphVertex { position: [-1.0, -1.0], uv: [0.0, 1.0], fg_color: [1.0; 4], bg_color: [0.0; 4] },
+                    GlyphVertex { position: [1.0, -1.0], uv: [1.0, 1.0], fg_color: [1.0; 4], bg_color: [0.0; 4] },
+                    GlyphVertex { position: [-1.0, 1.0], uv: [0.0, 0.0], fg_color: [1.0; 4], bg_color: [0.0; 4] },
+                    GlyphVertex { position: [1.0, 1.0], uv: [1.0, 0.0], fg_color: [1.0; 4], bg_color: [0.0; 4] },
+                ];
+                let overlay_indices: Vec<u32> = vec![0, 1, 2, 1, 3, 2];
+
+                let vert_bytes = bytemuck::cast_slice(&overlay_vertices);
+                let idx_bytes = bytemuck::cast_slice(&overlay_indices);
+
+                self.overlay_quad_vb = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("Overlay Quad Verts"),
+                    size: vert_bytes.len() as u64,
+                    usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+                self.overlay_quad_ib = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("Overlay Quad Idx"),
+                    size: idx_bytes.len() as u64,
+                    usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+
+                if let (Some(vb), Some(ib)) = (self.overlay_quad_vb.as_ref(), self.overlay_quad_ib.as_ref()) {
+                    queue.write_buffer(vb, 0, vert_bytes);
+                    queue.write_buffer(ib, 0, idx_bytes);
+                }
+
+                self.graphics_overlay_texture = Some(texture);
+                self.graphics_overlay_view = Some(view);
+            }
+        }
+
         let (surface, device, queue, config, bg_pipeline, fg_pipeline, bind_group) = match (
             &self.surface, &self.device, &self.queue, &self.surface_config,
             &self.pipeline, &self.fg_pipeline, &self.bind_group,
@@ -1734,6 +1985,19 @@ impl ApexApp {
             label: Some("Frame Encoder"),
         });
 
+        // Dispatch compute pass for glyph processing
+        if let (Some(ref cp), Some(ref cbg)) = (&self.compute_pipeline, &self.compute_bind_group) {
+            let pass_label = Some("Glyph Compute Pass");
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: pass_label,
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(cp);
+            compute_pass.set_bind_group(0, cbg, &[]);
+            // Dispatch with 1 workgroup for now (no glyphs yet)
+            compute_pass.dispatch_workgroups(1, 1, 1);
+        }
+
         {
             let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("Terminal Render Pass"),
@@ -1845,6 +2109,20 @@ impl ApexApp {
                         rp.set_vertex_buffer(0, dbg_vb.slice(..));
                         rp.set_index_buffer(dbg_ib.slice(..), wgpu::IndexFormat::Uint32);
                         rp.draw_indexed(0..self.debug_grid_indices.len() as u32, 0, 0..1);
+                    }
+                }
+            }
+
+            // Graphics overlay (Sixel/Kitty) — rendered on top of everything
+            if let Some(ref overlay_bg) = self.graphics_overlay_bind_group {
+                if let (Some(ref ovb), Some(ref oib)) = (&self.overlay_quad_vb, &self.overlay_quad_ib) {
+                    if let Some(ref op) = self.overlay_pipeline {
+                        rp.set_pipeline(op);
+                        rp.set_bind_group(0, bind_group, &[]);
+                        rp.set_bind_group(1, overlay_bg, &[]);
+                        rp.set_vertex_buffer(0, ovb.slice(..));
+                        rp.set_index_buffer(oib.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.draw_indexed(0..6, 0, 0..1);
                     }
                 }
             }
@@ -2090,7 +2368,59 @@ impl ApplicationHandler for ApexApp {
         self.shaper = Some(Shaper::new(CELL_SIZE));
         self.font_manager = Some(font_manager);
 
-        let (pipeline, fg_pipeline, bind_group, sampler) = Self::build_pipelines(&device, &config, &glyph_atlas.texture);
+        let (pipeline, fg_pipeline, bind_group, sampler, atlas_bgl) = Self::build_pipelines(&device, &config, &glyph_atlas.texture);
+
+        // Build overlay pipeline for graphics (Sixel/Kitty) overlay
+        let (overlay_pipeline, overlay_bgl, overlay_sampler) = Self::build_overlay_pipeline(&device, &config, &atlas_bgl);
+
+        // Build compute pipeline for GPU glyph processing
+        let (compute_pipeline, compute_bgl) = Self::build_compute_pipeline(&device);
+        let initial_glyph_buf_size = 4096u64;
+        let glyph_input_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Glyph Input Storage"),
+            size: initial_glyph_buf_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let glyph_output_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Glyph Output Storage"),
+            size: initial_glyph_buf_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let glyph_uniform_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Glyph Uniform"),
+            size: std::mem::size_of::<[f32; 2]>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Create a dummy bind group for now; will be rebuilt when actual glyph data is submitted
+        let dummy_input = device.create_buffer(&BufferDescriptor {
+            label: Some("Dummy Glyph Input"),
+            size: 64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let dummy_output = device.create_buffer(&BufferDescriptor {
+            label: Some("Dummy Glyph Output"),
+            size: 64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let compute_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Glyph Compute Bind Group"),
+            layout: &compute_bgl,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: dummy_input.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: dummy_output.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: glyph_uniform_buf.as_entire_binding() },
+            ],
+        });
+        self.compute_pipeline = Some(compute_pipeline);
+        self.compute_bind_group = Some(compute_bind_group);
+        self.glyph_input_buf = Some(glyph_input_buf);
+        self.glyph_output_buf = Some(glyph_output_buf);
+        self.glyph_uniform_buf = Some(glyph_uniform_buf);
 
         let win_w = config.width;
         let win_h = config.height;
@@ -2106,6 +2436,9 @@ impl ApplicationHandler for ApexApp {
         self.fg_pipeline = Some(fg_pipeline);
         self.bind_group = Some(bind_group);
         self.sampler = Some(sampler);
+        self.overlay_pipeline = Some(overlay_pipeline);
+        self.overlay_bgl = Some(overlay_bgl);
+        self.overlay_sampler = Some(overlay_sampler);
         self.vertex_buf = Some(vertex_buf);
         self.index_buf = Some(index_buf);
         self.fg_vertex_buf = Some(fg_vertex_buf);

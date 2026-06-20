@@ -12,6 +12,25 @@ pub struct VteProcessor {
     pub scrollback: ScrollbackBuffer,
     pub hyperlink_id: Option<ArrayString<64>>,
     pub clipboard_content: Option<String>,
+    // Graphics protocol data (Sixel/Kitty)
+    dcs_data: Vec<u8>,
+    dcs_active: bool,
+    pub graphics_image: Option<GraphicsImage>,
+}
+
+#[derive(Clone)]
+pub struct GraphicsImage {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub protocol: GraphicsProtocol,
+}
+
+#[derive(Clone, PartialEq)]
+pub enum GraphicsProtocol {
+    Sixel,
+    Kitty,
+    Unknown,
 }
 
 impl VteProcessor {
@@ -24,6 +43,9 @@ impl VteProcessor {
             scrollback: ScrollbackBuffer::new(scrollback_lines),
             hyperlink_id: None,
             clipboard_content: None,
+            dcs_data: Vec::new(),
+            dcs_active: false,
+            graphics_image: None,
         }
     }
 
@@ -35,6 +57,170 @@ impl VteProcessor {
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.grid.resize(rows, cols);
+    }
+
+    /// Parse Kitty graphics protocol OSC 1337 parameters
+    fn handle_kitty_protocol(&mut self, params: &[&[u8]]) {
+        // Expected format: a=T ; i=id ; f=format ; s=width,height ; data
+        // or: a=t ; i=id ; s=width,height ; data (transmit)
+        if params.len() < 2 { return; }
+
+        let mut action = String::new();
+        let mut image_data = Vec::new();
+        let mut width = 0u32;
+        let mut height = 0u32;
+
+        for param in &params[1..] {
+            let s = String::from_utf8_lossy(param);
+            if let Some(eq_pos) = s.find('=') {
+                let key = &s[..eq_pos];
+                let value = &s[eq_pos + 1..];
+                match key {
+                    "a" => action = value.to_string(),
+                    "s" => {
+                        if let Some(comma) = value.find(',') {
+                            width = value[..comma].parse().unwrap_or(0);
+                            height = value[comma + 1..].parse().unwrap_or(0);
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                // Remaining data is the image payload
+                if action == "t" || action == "T" {
+                    // Base64-encoded image data
+                    image_data.extend_from_slice(param);
+                }
+            }
+        }
+
+        if (action == "t" || action == "T") && !image_data.is_empty() && width > 0 && height > 0 {
+            // Decode base64 and store
+            use base64::Engine;
+            let engine = base64::engine::general_purpose::STANDARD;
+            match engine.decode(&image_data) {
+                Ok(decoded) => {
+                    self.graphics_image = Some(GraphicsImage {
+                        data: decoded,
+                        width,
+                        height,
+                        protocol: GraphicsProtocol::Kitty,
+                    });
+                }
+                Err(e) => {
+                    log::warn!("Kitty graphics decode error: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Parse Sixel image data from DCS capture
+    fn parse_sixel_data(&mut self, data: &[u8]) {
+        // Sixel format: ESC P q <params> ; <sixel data>
+        // The data contains color register definitions and sixel pixel patterns
+        let data_str = std::str::from_utf8(data).unwrap_or("");
+        // Simply parse sixel data with default dimensions
+        let width = 320;
+        let height = 100;
+
+        // Sixel data consists of:
+        // - Color register definitions: #n;r;g;b  (set color n to RGB value)
+        // - Sixel pixel patterns: each byte 0x3F-0x7E represents 6 pixels
+        // - Newline: moves cursor to next row
+        // - '$' character: moves cursor to next column in same row
+
+        // Simple sixel decoder: parse color definitions and raster patterns
+        let mut pixels: Vec<u8> = vec![255u8; (width * height * 4) as usize]; // RGBA
+        let mut colors: Vec<[u8; 4]> = vec![[0, 0, 0, 255]; 256];
+        let mut row = 0usize;
+        let mut col = 0usize;
+
+        // Try to extract raster data from the sixel stream
+        // We process character by character
+        let chars: Vec<char> = data_str.chars().collect();
+        let mut i = 0;
+        while i < chars.len() && row < height as usize {
+            let c = chars[i];
+            match c {
+                '#' => {
+                    // Color register: #n or #n;r;g;b
+                    i += 1;
+                    let mut num_str = String::new();
+                    while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == ';') {
+                        if chars[i] == ';' { break; }
+                        num_str.push(chars[i]);
+                        i += 1;
+                    }
+                    if let Ok(n) = num_str.parse::<usize>() {
+                        if i < chars.len() && chars[i] == ';' {
+                            i += 1; // skip ';'
+                            // Parse R;G;B
+                            let mut comps = [0u8; 3];
+                            for comp in comps.iter_mut() {
+                                let mut val_str = String::new();
+                                while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == ';') {
+                                    if chars[i] == ';' { break; }
+                                    val_str.push(chars[i]);
+                                    i += 1;
+                                }
+                                if let Ok(v) = val_str.parse::<u8>() {
+                                    *comp = v;
+                                }
+                                if i < chars.len() && chars[i] == ';' {
+                                    i += 1;
+                                }
+                            }
+                            if n < 256 {
+                                colors[n] = [comps[0], comps[1], comps[2], 255];
+                            }
+                        } else if n < 256 {
+                            // Use color from terminal palette if just #n
+                        }
+                    }
+                }
+                '$' => {
+                    // Carriage return (move to next row)
+                    row = row.saturating_add(6);
+                    col = 0;
+                }
+                '-' => {
+                    // Move to next row
+                    row = row.saturating_add(6);
+                    col = 0;
+                }
+                c if (c as u8) >= 0x3F && (c as u8) <= 0x7E => {
+                    // Sixel data: each byte represents 6 vertical pixels
+                    let sixel_byte = c as u8;
+                    let sixel_val = sixel_byte - 0x3F;
+                    // Each bit represents one pixel in a 6-high column
+                    let current_color = colors[0]; // Use last set color
+                    for bit in 0..6 {
+                        if sixel_val & (1 << bit) != 0 {
+                            let py = row + bit;
+                            if py < height as usize && col < width as usize {
+                                let idx = (py * width as usize + col) * 4;
+                                if idx + 3 < pixels.len() {
+                                    pixels[idx] = current_color[2]; // BGR -> RGB
+                                    pixels[idx + 1] = current_color[1];
+                                    pixels[idx + 2] = current_color[0];
+                                    pixels[idx + 3] = current_color[3];
+                                }
+                            }
+                        }
+                    }
+                    col += 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+
+        self.graphics_image = Some(GraphicsImage {
+            data: pixels,
+            width,
+            height,
+            protocol: GraphicsProtocol::Sixel,
+        });
     }
 
     fn set_char(&mut self, c: char) {
@@ -660,11 +846,48 @@ impl Perform for VteProcessor {
                     self.clipboard_content = Some(data.to_string());
                 }
             }
+            "1337" => {
+                // OSC 1337: Kitty graphics protocol
+                self.handle_kitty_protocol(params);
+            }
             _ => {}
         }
     }
 
-    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
-    fn put(&mut self, _byte: u8) {}
-    fn unhook(&mut self) {}
+    fn hook(&mut self, params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
+        match action {
+            'q' => {
+                // Sixel: ESC P q <params> ; <data> ESC \
+                self.dcs_data.clear();
+                self.dcs_active = true;
+                // Store params as header
+                for param in params.iter() {
+                    for &v in param {
+                        let s = format!("{};", v);
+                        self.dcs_data.extend_from_slice(s.as_bytes());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn put(&mut self, byte: u8) {
+        if self.dcs_active {
+            self.dcs_data.push(byte);
+        }
+    }
+
+    fn unhook(&mut self) {
+        if self.dcs_active {
+            self.dcs_active = false;
+            // Determine protocol from header
+            let header = String::from_utf8_lossy(&self.dcs_data);
+            if header.starts_with("q") || header.contains(";") {
+                // Sixel format: params;data — clone data to avoid borrow conflict
+                let data = self.dcs_data.clone();
+                self.parse_sixel_data(&data);
+            }
+        }
+    }
 }

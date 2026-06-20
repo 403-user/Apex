@@ -15,6 +15,9 @@ struct VertexOutput {
 @group(0) @binding(0) var glyph_atlas: texture_2d<f32>;
 @group(0) @binding(1) var glyph_sampler: sampler;
 
+@group(1) @binding(0) var overlay_tex: texture_2d<f32>;
+@group(1) @binding(1) var overlay_sampler: sampler;
+
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
@@ -32,4 +35,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let fg = input.fg_color;
     let blended = mix(bg, fg, glyph_alpha);
     return vec4<f32>(blended.rgb, 1.0);
+}
+
+@fragment
+fn fs_overlay(input: VertexOutput) -> @location(0) vec4<f32> {
+    let color = textureSample(overlay_tex, overlay_sampler, input.uv);
+    return color;
 }

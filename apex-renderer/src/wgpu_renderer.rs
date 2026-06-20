@@ -24,6 +24,8 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
+use directories::ProjectDirs;
+use notify::Watcher;
 use std::time::Instant;
 use std::os::fd::AsRawFd;
 use tokio::sync::mpsc;
@@ -38,6 +40,26 @@ use apex_config::ApexConfig;
 use vte_core::grid::CellFlags;
 use apex_pty::PtyInstance;
 use vte_core::parser::VteProcessor;
+
+fn locate_theme_path(name: &str) -> Option<std::path::PathBuf> {
+    // Built-in themes have no external file
+    if matches!(name, "kali-dark" | "default" | "backtrack") {
+        return None;
+    }
+    let mut paths = vec![
+        std::path::PathBuf::from(format!("/etc/apex/themes/{}.toml", name)),
+        std::path::PathBuf::from(format!("themes/{}.toml", name)),
+    ];
+    if let Some(proj_dirs) = ProjectDirs::from("com", "apex", "apex") {
+        paths.push(proj_dirs.config_dir().join("themes").join(format!("{}.toml", name)));
+    }
+    for p in paths {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
 
 const MIN_FRAME_TIME: std::time::Duration = std::time::Duration::from_millis(16); // ~60fps
 
@@ -149,6 +171,8 @@ struct ApexApp {
     debug_vb: Option<wgpu::Buffer>,
     debug_ib: Option<wgpu::Buffer>,
     theme: Theme,
+    theme_file_path: Option<PathBuf>,
+    theme_reload_rx: Option<std::sync::mpsc::Receiver<()>>,
     dec_vb: Option<wgpu::Buffer>,
     dec_ib: Option<wgpu::Buffer>,
     shaped_row_cache: HashMap<(u64, u16), (Vec<ShapedGlyph>, Vec<usize>, Vec<TextDirection>, Vec<usize>, u64)>,
@@ -203,8 +227,10 @@ impl ApexApp {
             input_tx: None,
             output_rx: None,
             pty_reader: None,
-            atlas_dump,
-            theme,
+                    atlas_dump,
+                    theme,
+                    theme_file_path: None,
+                    theme_reload_rx: None,
             row_cache: Vec::new(),
             render_epoch: 0,
             raster_tx: None,
@@ -1412,8 +1438,9 @@ impl ApexApp {
             [px * sx + ox, py * sy + oy]
         };
 
-        // Search highlight color — semi-transparent yellow
-        let search_color = [0.8, 0.6, 0.0, 0.4];
+        // Search highlight color — theme-derived selection color with alpha
+        let (sr, sg, sb) = self.theme.selection_rgb();
+        let search_color = [sr, sg, sb, 0.4];
 
         for m in &self.search.matches {
             for row in m.start_row..=m.end_row {
@@ -1880,6 +1907,28 @@ impl ApexApp {
         self.output_rx.take();
         self.pty.take();
     }
+
+    /// Reload the current theme from disk, trigger redraw
+    fn reload_theme(&mut self) {
+        // Theme path should be set during initialization
+        if let Some(ref theme_path) = self.theme_file_path {
+            if let Ok(metadata) = std::fs::metadata(theme_path) {
+                if let Ok(_mtime) = metadata.modified() {
+                    // Try to load theme from file
+                    // Try to load the new theme
+                    let new_theme = Theme::from_name(&self.theme.name);
+                    if new_theme != self.theme {
+                        self.theme = new_theme;
+                        self.needs_redraw = true;
+                        if let Some(ref window) = self.window {
+                            window.request_redraw();
+                        }
+                        log::info!("Theme reloaded from {:?}", theme_path);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Drop for ApexApp {
@@ -2015,7 +2064,13 @@ impl ApplicationHandler for ApexApp {
             }
         };
         let primary_id = font_manager.primary_font_id();
-        let primary_font = font_manager.font(primary_id).unwrap();
+        let primary_font = match font_manager.font(primary_id) {
+            Some(f) => f,
+            None => {
+                log::error!("Primary font not found");
+                return;
+            }
+        };
 
         let glyph_atlas = match GlyphAtlas::new_with_font(
             &device, &queue, primary_font.clone(), self.atlas_dump.as_deref(),
@@ -2328,6 +2383,14 @@ impl ApplicationHandler for ApexApp {
     }
 
     fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
+        // Check for theme reload signals
+        if let Some(rx) = self.theme_reload_rx.take() {
+            while rx.try_recv().is_ok() {
+                self.reload_theme();
+            }
+            self.theme_reload_rx = Some(rx);
+        }
+
         if let Some(ref mut rx) = self.output_rx {
             while let Ok(data) = rx.try_recv() {
                 self.processor.advance(&data);
@@ -2398,7 +2461,58 @@ impl WgpuRenderer {
         let atlas_dump = self.atlas_dump.take();
         let theme = self.theme.clone();
         let mut app = ApexApp::new(self.scrollback_lines, theme, atlas_dump);
+
+        // Set up theme hot‑reload if we can locate a theme file
+        if let Some(theme_path) = locate_theme_path(&app.theme.name) {
+            // Channel for reload notifications
+            let (reload_tx, reload_rx) = std::sync::mpsc::channel();
+            app.theme_reload_rx = Some(reload_rx);
+            app.theme_file_path = Some(theme_path.clone());
+
+            // Spawn a watcher thread that forwards file change events to the reload channel
+            std::thread::spawn(move || {
+                // Channel for notify crate events
+                let (watch_tx, watch_rx) = std::sync::mpsc::channel();
+                // Create watcher that forwards events onto watch_tx
+                let mut watcher = match notify::recommended_watcher(move |res| {
+                    let _ = watch_tx.send(res);
+                }) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        log::error!("Failed to create theme watcher: {}", e);
+                        return;
+                    }
+                };
+                if let Err(e) = watcher.watch(&theme_path, notify::RecursiveMode::NonRecursive) {
+                    log::error!("Failed to watch theme file {}: {}", theme_path.display(), e);
+                    return;
+                }
+                // Loop over events; each triggers a reload signal (ignore details)
+                for _ in watch_rx {
+                    let _ = reload_tx.send(());
+                }
+            });
+        }
+
         event_loop.run_app(&mut app)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locate_theme_path_builtin() {
+        assert!(locate_theme_path("kali-dark").is_none());
+        assert!(locate_theme_path("default").is_none());
+        assert!(locate_theme_path("backtrack").is_none());
+    }
+
+    #[test]
+    fn locate_theme_path_custom() {
+        // Non-built-in names return None when file doesn't exist
+        assert!(locate_theme_path("nonexistent_theme").is_none());
     }
 }

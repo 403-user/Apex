@@ -23,3 +23,6 @@ vte-core = { path = "../vte-core" }
 apex-pty = { path = "../apex-pty" }
 tokio = { version = "1", features = ["full"] }
 apex-config = { path = "../apex-config" }
+notify = "6"
+
+directories = "5"

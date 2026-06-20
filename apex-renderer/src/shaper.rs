@@ -57,8 +57,13 @@ impl Shaper {
         &self, font_data: &[u8], font_id: FontId,
         run: &TextRun, cluster_to_col: &[usize],
     ) -> Vec<ShapedGlyph> {
-        let face = rustybuzz::Face::from_slice(font_data, 0)
-            .expect("Invalid font data in shaper");
+        let face = match rustybuzz::Face::from_slice(font_data, 0) {
+            Some(f) => f,
+            None => {
+                log::error!("Invalid font data in shaper");
+                return Vec::new();
+            }
+        };
         let upem = face.units_per_em() as f32;
 
         let mut buffer = rustybuzz::UnicodeBuffer::new();
